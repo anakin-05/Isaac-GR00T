@@ -324,4 +324,20 @@ class Gr00tTrainer(Trainer):
                     pred_sample,
                 )
 
+        # --------------------------------------------------------------
+        # Round-trip consistency: log forward/backward flow-matching loss
+        # breakdown when present (see Gr00tN1d7ActionHead.forward). Independent
+        # of the "labels" gate above since Gr00tN1d7 outputs never contain
+        # "labels" - this fires whenever the action head reports a direction
+        # breakdown, regardless of enable_direction_conditioning.
+        # --------------------------------------------------------------
+        if (
+            self.state.global_step % self.args.logging_steps == 0
+            and model.training
+            and self.args.local_rank in (-1, 0)
+        ):
+            for key in ("forward_action_loss", "backward_action_loss"):
+                if key in outputs and torch.isfinite(outputs[key]):
+                    self.log({f"train_{key}": outputs[key].item()})
+
         return (loss, outputs) if return_outputs else loss

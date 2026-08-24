@@ -23,9 +23,13 @@ Uses the same modality configs and statistics from the test fixtures directory
 import json
 from pathlib import Path
 
+from gr00t.data.state_action.action_chunking import EndEffectorActionChunk
+from gr00t.data.state_action.pose import EndEffectorPose
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
+from gr00t.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType, ModalityConfig
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 
 FIXTURE_DIR = Path(__file__).parent.parent.parent.parent / "fixtures" / "processor_config"
@@ -207,6 +211,199 @@ class TestApplyConvenience:
             np.testing.assert_allclose(rec_state[key], raw_state[key], atol=1e-4)
         for key in action_keys:
             np.testing.assert_allclose(rec_action[key], raw_action[key], atol=1e-4)
+
+
+def _self_consistent_absolute_setup():
+    """Rebuild the libero_sim fixture's processor with state statistics
+    overridden to match action statistics per key - apply_reversed needs
+    state[state_key] and action[key] to be dimensionally compatible (they
+    represent the same physical channel at different times), which the
+    plain libero_sim fixture's independently-chosen per-key state/action
+    dims don't otherwise guarantee (apply_action never needs that for an
+    ABSOLUTE-rep key, since it never combines the two; apply_reversed does).
+    Returns (processor, action_keys, fixed_statistics)."""
+    modality_configs, statistics = _load_fixture_configs()
+    fixed_statistics = json.loads(json.dumps(statistics))
+    action_keys = modality_configs[EMBODIMENT]["action"]["modality_keys"]
+    for key in action_keys:
+        fixed_statistics[EMBODIMENT]["state"][key] = fixed_statistics[EMBODIMENT]["action"][key]
+    proc = StateActionProcessor(
+        modality_configs=modality_configs,
+        statistics=fixed_statistics,
+        clip_outliers=False,
+    )
+    return proc, action_keys, fixed_statistics
+
+
+def _random_within_range(keys, statistics, horizon):
+    """Random values kept strictly within each key's [min, max] (mirrors
+    TestActionNormalization.test_action_roundtrip's approach). Necessary
+    here (unlike the unconstrained _random_action/_random_state helpers)
+    because unnormalize_values_minmax clips its input to the normalized
+    [-1, 1] range independent of clip_outliers, so an unconstrained value
+    would silently lose precision on the way back out - a pre-existing,
+    unrelated property of denormalization, not of apply_reversed."""
+    result = {}
+    for k in keys:
+        stats = statistics[EMBODIMENT]["action"][k]
+        low, high = np.array(stats["min"]), np.array(stats["max"])
+        result[k] = (low + (high - low) * np.random.rand(horizon, len(low))).astype(np.float32)
+    return result
+
+
+class TestApplyReversedAbsolute:
+    """Test apply_reversed for ABSOLUTE-rep actions (the libero_sim fixture -
+    all keys are ABSOLUTE/NON_EEF), i.e. the temporal-reversal-only path."""
+
+    def test_apply_reversed_returns_tuple(self):
+        proc, action_keys, statistics = _self_consistent_absolute_setup()
+        raw_state = _random_within_range(action_keys, statistics, horizon=1)
+        raw_action = _random_within_range(action_keys, statistics, horizon=4)
+        result = proc.apply_reversed(raw_state, raw_action, EMBODIMENT)
+        assert isinstance(result, tuple) and len(result) == 2
+        norm_state, norm_action = result
+        assert set(norm_state.keys()) == set(action_keys)
+        assert set(norm_action.keys()) == set(action_keys)
+
+    def test_matches_manual_temporal_reversal(self):
+        """Denormalized apply_reversed output must match a hand-computed
+        temporal reversal: backward[-1] == state_t, new_state == forward[-1]."""
+        proc, action_keys, statistics = _self_consistent_absolute_setup()
+        raw_state = _random_within_range(action_keys, statistics, horizon=1)
+        raw_action = _random_within_range(action_keys, statistics, horizon=4)
+
+        norm_state, norm_action = proc.apply_reversed(raw_state, raw_action, EMBODIMENT)
+        raw_new_state = proc.unapply_state(norm_state, EMBODIMENT)
+        raw_backward_action = proc.unapply_action(norm_action, EMBODIMENT)
+
+        for key in action_keys:
+            current_value = raw_state[key][-1]  # (D,)
+            forward_array = raw_action[key]  # (H, D)
+            full = np.concatenate([current_value[None, :], forward_array], axis=0)
+            expected_backward = full[::-1][1:]
+            expected_new_reference = full[::-1][0]
+
+            np.testing.assert_allclose(
+                raw_backward_action[key], expected_backward, atol=1e-3, rtol=1e-3
+            )
+            # new state was tiled across the state-history dimension
+            np.testing.assert_allclose(
+                raw_new_state[key][-1], expected_new_reference, atol=1e-3, rtol=1e-3
+            )
+            # Round-trip: last element of the backward chunk recovers state_t.
+            np.testing.assert_allclose(
+                raw_backward_action[key][-1], current_value, atol=1e-3, rtol=1e-3
+            )
+
+
+# ---------------------------------------------------------------------------
+# Custom RELATIVE-rep (EEF) fixture for apply_reversed's SE(3)-composition path
+# ---------------------------------------------------------------------------
+
+RELATIVE_EMBODIMENT = "test_relative_eef"
+
+
+def _random_eef_pose() -> EndEffectorPose:
+    return EndEffectorPose(
+        translation=np.random.randn(3),
+        rotation=Rotation.random().as_quat(),
+        rotation_type="quat",
+        rotation_order="xyzw",
+    )
+
+
+def _wide_stats(dim: int) -> dict:
+    """Statistics with a wide enough range that clip_outliers=False plus
+    random composed poses never hits a normalization edge case."""
+    return {"min": [-100.0] * dim, "max": [100.0] * dim, "mean": [0.0] * dim, "std": [50.0] * dim}
+
+
+def _relative_eef_processor(action_rep: ActionRepresentation = ActionRepresentation.RELATIVE):
+    modality_configs = {
+        RELATIVE_EMBODIMENT: {
+            "state": ModalityConfig(delta_indices=[0], modality_keys=["eef", "gripper"]),
+            "action": ModalityConfig(
+                delta_indices=list(range(4)),
+                modality_keys=["eef", "gripper"],
+                action_configs=[
+                    ActionConfig(
+                        rep=action_rep,
+                        type=ActionType.EEF,
+                        format=ActionFormat.XYZ_ROTVEC,
+                        state_key="eef",
+                    ),
+                    ActionConfig(
+                        rep=ActionRepresentation.ABSOLUTE,
+                        type=ActionType.NON_EEF,
+                        format=ActionFormat.DEFAULT,
+                        state_key="gripper",
+                    ),
+                ],
+            ),
+        }
+    }
+    statistics = {
+        RELATIVE_EMBODIMENT: {
+            "state": {"eef": _wide_stats(6), "gripper": _wide_stats(1)},
+            "action": {"eef": _wide_stats(6), "gripper": _wide_stats(1)},
+            "relative_action": {"eef": _wide_stats(6)},
+        }
+    }
+    return StateActionProcessor(
+        modality_configs=modality_configs,
+        statistics=statistics,
+        use_relative_action=True,
+        clip_outliers=False,
+    )
+
+
+class TestApplyReversedRelative:
+    """Test apply_reversed for RELATIVE-rep (EEF) actions - the SE(3)
+    composition path via ActionChunk.to_reversed_chunking."""
+
+    def test_matches_manual_composition(self):
+        np.random.seed(2)
+        proc = _relative_eef_processor()
+        horizon = 4
+
+        state_pose = _random_eef_pose()
+        gripper_t = np.array([0.3])
+        state = {
+            "eef": state_pose.xyz_rotvec[None, :],  # (1, 6)
+            "gripper": gripper_t[None, :],  # (1, 1)
+        }
+
+        absolute_poses = [_random_eef_pose() for _ in range(horizon)]
+        action_eef = EndEffectorActionChunk(absolute_poses).to(ActionFormat.XYZ_ROTVEC)  # (H, 6)
+        gripper_forward = np.random.uniform(-1, 1, size=(horizon, 1))
+        action = {"eef": action_eef, "gripper": gripper_forward}
+
+        norm_state, norm_action = proc.apply_reversed(state, action, RELATIVE_EMBODIMENT)
+        raw_new_state = proc.unapply_state(norm_state, RELATIVE_EMBODIMENT)
+        raw_backward_action = proc.unapply_action(
+            norm_action, RELATIVE_EMBODIMENT, state=raw_new_state
+        )
+
+        # Round-trip: the last timestep of the decoded backward EEF chunk
+        # (composed forward from the new reference state_{t+H}) must recover
+        # the original state_t.
+        np.testing.assert_allclose(
+            raw_backward_action["eef"][-1], state["eef"][0], atol=1e-3, rtol=1e-3
+        )
+        # Gripper (ABSOLUTE rep): plain temporal reversal.
+        np.testing.assert_allclose(
+            raw_backward_action["gripper"][-1], gripper_t, atol=1e-3, rtol=1e-3
+        )
+        np.testing.assert_allclose(
+            raw_new_state["gripper"][-1], gripper_forward[-1], atol=1e-3, rtol=1e-3
+        )
+
+    def test_delta_representation_raises(self):
+        proc = _relative_eef_processor(action_rep=ActionRepresentation.DELTA)
+        state = {"eef": np.zeros((1, 6)), "gripper": np.zeros((1, 1))}
+        action = {"eef": np.zeros((4, 6)), "gripper": np.zeros((4, 1))}
+        with pytest.raises(NotImplementedError, match="DELTA"):
+            proc.apply_reversed(state, action, RELATIVE_EMBODIMENT)
 
 
 class TestSinCosEncoding:

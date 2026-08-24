@@ -391,7 +391,9 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional parameters forwarded to the model's get_action
+                (e.g. RTC inpainting params, or round-trip consistency's
+                "direction"/"drop_vision" - see Gr00tN1d7ActionHead.get_action_with_features)
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -414,7 +416,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

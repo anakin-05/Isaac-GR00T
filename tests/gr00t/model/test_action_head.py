@@ -238,6 +238,164 @@ class TestActionHeadTimeSamplingMetaSafe:
         assert torch.equal(s_real, s_meta)
 
 
+class TestActionHeadDirectionConditioning:
+    """Round-trip consistency: direction conditioning, backward loss
+    weighting, and vision dropout on the action head (see the integration
+    plan). The most important test here is
+    ``test_disabled_by_default_loss_formula_unchanged`` - it's the
+    regression guard that the feature is a true no-op when off.
+    """
+
+    def test_disabled_by_default_loss_formula_unchanged(self, action_head):
+        """Today's fixture (no "direction"/"drop_vision" keys) must produce
+        the exact same loss-reduction formula as before this feature existed,
+        and must not add the forward/backward loss breakdown keys."""
+        head, config = action_head
+        head.train()
+        action_input = _make_action_input(config)
+        assert "direction" not in action_input
+        assert "drop_vision" not in action_input
+        out = head.forward(_make_backbone_output(config), action_input)
+        expected_loss = out["action_loss"].sum() / (out["action_mask"].sum() + 1e-6)
+        assert torch.allclose(out["loss"], expected_loss)
+        assert "forward_action_loss" not in out
+        assert "backward_action_loss" not in out
+
+    def _mixed_direction(self, batch_size: int) -> torch.Tensor:
+        return torch.tensor([0, 1] * (batch_size // 2 + 1))[:batch_size]
+
+    def test_backward_loss_weighting(self, action_head):
+        head, config = action_head
+        head.train()
+        config.backward_loss_weight = 2.0
+        action_input = _make_action_input(config)
+        direction = self._mixed_direction(action_input["state"].shape[0])
+        action_input["direction"] = direction
+
+        out = head.forward(_make_backbone_output(config), action_input)
+
+        action_loss, action_mask = out["action_loss"], out["action_mask"]
+        is_backward = (direction == 1)[:, None, None].to(dtype=action_loss.dtype)
+        weight = 1.0 + is_backward * (config.backward_loss_weight - 1.0)
+        expected_loss = (action_loss * weight).sum() / ((action_mask * weight).sum() + 1e-6)
+        assert torch.allclose(out["loss"], expected_loss)
+
+    def test_backward_loss_weight_one_matches_unweighted_formula(self, action_head):
+        """backward_loss_weight=1.0 must reduce to the plain sum()/sum() formula
+        even when direction rows are present."""
+        head, config = action_head
+        head.train()
+        config.backward_loss_weight = 1.0
+        action_input = _make_action_input(config)
+        action_input["direction"] = self._mixed_direction(action_input["state"].shape[0])
+
+        out = head.forward(_make_backbone_output(config), action_input)
+        expected_loss = out["action_loss"].sum() / (out["action_mask"].sum() + 1e-6)
+        assert torch.allclose(out["loss"], expected_loss)
+
+    def test_forward_backward_loss_breakdown(self, action_head):
+        head, config = action_head
+        head.train()
+        action_input = _make_action_input(config)
+        direction = self._mixed_direction(action_input["state"].shape[0])
+        action_input["direction"] = direction
+
+        out = head.forward(_make_backbone_output(config), action_input)
+        assert torch.isfinite(out["forward_action_loss"])
+        assert torch.isfinite(out["backward_action_loss"])
+
+        per_example = out["action_loss"].sum(dim=(1, 2)) / (
+            out["action_mask"].sum(dim=(1, 2)) + 1e-6
+        )
+        assert torch.allclose(out["forward_action_loss"], per_example[direction == 0].mean())
+        assert torch.allclose(out["backward_action_loss"], per_example[direction == 1].mean())
+
+    def test_forward_backward_loss_breakdown_all_one_direction_is_nan(self, action_head):
+        """If a batch has no rows of one direction, that direction's mean is
+        reported as NaN (not a crash / not silently 0)."""
+        head, config = action_head
+        head.train()
+        action_input = _make_action_input(config)
+        batch_size = action_input["state"].shape[0]
+        action_input["direction"] = torch.zeros(batch_size, dtype=torch.long)  # all forward
+
+        out = head.forward(_make_backbone_output(config), action_input)
+        assert torch.isfinite(out["forward_action_loss"])
+        assert torch.isnan(out["backward_action_loss"])
+
+    def test_process_backbone_output_vision_dropout_masks_image_tokens(self, action_head):
+        head, config = action_head
+        # Isolate the masking logic from vlln/self-attention (LayerNorm's bias
+        # would otherwise make a zeroed token's post-vlln value nonzero).
+        head.vlln = torch.nn.Identity()
+        head.vl_self_attention = torch.nn.Identity()
+
+        backbone_output = _make_backbone_output(config)
+        original_features = backbone_output["backbone_features"].clone()
+        image_mask = backbone_output["image_mask"]
+        batch_size = original_features.shape[0]
+        drop_vision = torch.zeros(batch_size, dtype=torch.bool)
+        drop_vision[0] = True
+
+        result = head.process_backbone_output(backbone_output, drop_vision=drop_vision)
+        features = result["backbone_features"]
+
+        # Row 0 (dropped): image-token positions exactly zero, others unchanged.
+        assert torch.all(features[0][image_mask[0]] == 0)
+        assert torch.equal(features[0][~image_mask[0]], original_features[0][~image_mask[0]])
+        # Remaining rows (not dropped): completely unchanged.
+        assert torch.equal(features[1:], original_features[1:])
+
+    def test_process_backbone_output_no_drop_vision_is_noop(self, action_head):
+        head, config = action_head
+        head.vlln = torch.nn.Identity()
+        head.vl_self_attention = torch.nn.Identity()
+        backbone_output = _make_backbone_output(config)
+        original_features = backbone_output["backbone_features"].clone()
+        result = head.process_backbone_output(backbone_output, drop_vision=None)
+        assert torch.equal(result["backbone_features"], original_features)
+
+    def test_get_action_direction_option_noop_at_init(self, action_head):
+        """Zero-initialized direction_embedding => direction=1 matches
+        direction=0/None exactly (same seed) until trained."""
+        head, config = action_head
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        backbone_output = _make_backbone_output(config)
+
+        torch.manual_seed(0)
+        out_default = head.get_action(backbone_output, action_input, options=None)
+        torch.manual_seed(0)
+        out_backward = head.get_action(backbone_output, action_input, options={"direction": 1})
+        assert torch.allclose(out_default["action_pred"], out_backward["action_pred"], atol=1e-5)
+
+    def test_get_action_direction_option_diverges_after_perturbation(self, action_head):
+        head, config = action_head
+        with torch.no_grad():
+            head.model.direction_embedding.weight[1].normal_(mean=0.0, std=1.0)
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        backbone_output = _make_backbone_output(config)
+
+        torch.manual_seed(0)
+        out_default = head.get_action(backbone_output, action_input, options=None)
+        torch.manual_seed(0)
+        out_backward = head.get_action(backbone_output, action_input, options={"direction": 1})
+        assert out_default["action_pred"].shape == out_backward["action_pred"].shape
+        assert not torch.allclose(out_default["action_pred"], out_backward["action_pred"])
+
+    def test_get_action_drop_vision_option_runs(self, action_head):
+        """Smoke test: drop_vision threads through get_action -> _encode_features
+        -> process_backbone_output without error and preserves output shape."""
+        head, config = action_head
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        out = head.get_action(
+            _make_backbone_output(config), action_input, options={"drop_vision": True}
+        )
+        assert out["action_pred"].shape == (2, config.action_horizon, config.max_action_dim)
+
+
 class TestActionHeadTrainableParams:
     """Test parameter freezing."""
 

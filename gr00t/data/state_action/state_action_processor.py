@@ -49,6 +49,33 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _reverse_absolute_action(
+    current_value: np.ndarray, forward_array: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Temporally reverse an ABSOLUTE-representation action chunk (e.g. gripper).
+
+    ABSOLUTE-rep values have no SE(3)/vector "inverse" - the backward target is
+    simply the same recorded values walked in reverse chronological order. This
+    has no physical "undo" meaning (you cannot un-grasp an object by reversing a
+    gripper command); it is a regression-consistency construction, not a claim
+    about dynamics reversibility.
+
+    Args:
+        current_value: (D,) value at t (the state this chunk starts from).
+        forward_array: (H, D) recorded values at t+1..t+H.
+
+    Returns:
+        Tuple of (backward_array, new_reference_value) where backward_array is
+        (H, D) = values at t+H-1..t (chronologically reversed, dropping the
+        endpoint which becomes the new reference), and new_reference_value is
+        (D,) = the value at t+H (this chunk's own endpoint).
+    """
+    full = np.concatenate([current_value[None, :], forward_array], axis=0)  # (H+1, D)
+    reversed_full = full[::-1]
+    return reversed_full[1:], reversed_full[0]
+
+
 class StateActionProcessor:
     """
     Unified processor for robot state and action data.
@@ -394,6 +421,17 @@ class StateActionProcessor:
                     )
 
         # Step 2: Normalize actions
+        return self._normalize_action_dict(action, embodiment_tag)
+
+    def _normalize_action_dict(
+        self, action: dict[str, np.ndarray], embodiment_tag: str
+    ) -> dict[str, np.ndarray]:
+        """
+        Normalize an already-representation-resolved action dict (i.e. the
+        conversion to relative/absolute representation, if any, has already
+        happened). Shared by `apply_action` (Step 2) and `apply_reversed`.
+        """
+        modality_keys = self.modality_configs[embodiment_tag]["action"].modality_keys
         normalized_values = {}
         for joint_group in modality_keys:
             if joint_group not in action:
@@ -553,6 +591,94 @@ class StateActionProcessor:
             processed_action = {}
         return processed_state, processed_action
 
+    def apply_reversed(
+        self,
+        state: dict[str, np.ndarray],
+        action: dict[str, np.ndarray],
+        embodiment_tag: str,
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        """
+        Construct a BACKWARD (round-trip consistency, direction=1) training example
+        from the same (state, action) pair already loaded for the forward direction.
+
+        Rather than sampling new data, this derives a "return trip": the
+        conditioning state becomes this chunk's own composed endpoint
+        (state_{t+H}), and the target action becomes the chronologically
+        reversed ("undo") chunk that composes back onto the original state_t.
+        This requires no new I/O - only the same (state, action) already
+        extracted for the forward example.
+
+        Args:
+            state: Dict mapping joint_group -> raw state values, same contract as `apply`.
+            action: Dict mapping joint_group -> raw action values, same contract as `apply`.
+            embodiment_tag: Embodiment identifier.
+
+        Returns:
+            Tuple of (processed_state, processed_action) for the backward example, in
+            the same normalized representation `apply()` returns for the forward direction.
+
+        Raises:
+            ValueError: If action_configs is not set for this embodiment (needed to
+                determine each action key's representation/type for inversion), or a
+                referenced state key is missing.
+            NotImplementedError: If any action key uses ActionRepresentation.DELTA
+                (chained per-step deltas), which this method does not support.
+        """
+        action = deepcopy(action)
+        # Default: carry forward the original state unchanged for any joint_group with
+        # no corresponding action key to derive an updated value from (a low-risk
+        # approximation - see plan caveats).
+        raw_new_state = deepcopy(state)
+
+        modality_keys = self.modality_configs[embodiment_tag]["action"].modality_keys
+        action_configs = self.modality_configs[embodiment_tag]["action"].action_configs
+
+        if action_configs is None:
+            raise ValueError(
+                f"apply_reversed requires action_configs to be set for embodiment "
+                f"'{embodiment_tag}' (needed to determine each action key's "
+                f"representation/type for inversion)."
+            )
+
+        for key, action_config in zip(modality_keys, action_configs):
+            state_key = action_config.state_key if action_config.state_key else key
+            if state_key not in state:
+                raise KeyError(
+                    f"Reference state key '{state_key}' not found in state dict "
+                    f"for embodiment '{embodiment_tag}'"
+                )
+            reference_state = state[state_key][-1]
+
+            if action_config.rep == ActionRepresentation.DELTA:
+                raise NotImplementedError(
+                    f"apply_reversed does not support ActionRepresentation.DELTA "
+                    f"(chained per-step deltas) for action key '{key}' in embodiment "
+                    f"'{embodiment_tag}'. Only RELATIVE and ABSOLUTE are supported."
+                )
+            elif action_config.rep == ActionRepresentation.RELATIVE and self.use_relative_action:
+                reversed_action, new_reference = self._reverse_relative_action(
+                    action=action[key],
+                    reference_state=reference_state,
+                    action_type=action_config.type,
+                    action_format=action_config.format,
+                )
+            else:
+                # ABSOLUTE rep, or RELATIVE rep with use_relative_action disabled -
+                # mirrors apply_action's Step 1 gate, which likewise skips conversion
+                # (and normalizes the raw values directly) in that case.
+                reversed_action, new_reference = _reverse_absolute_action(
+                    current_value=reference_state, forward_array=action[key]
+                )
+
+            action[key] = reversed_action
+            raw_new_state[state_key] = np.tile(
+                new_reference[None, :], (state[state_key].shape[0], 1)
+            )
+
+        processed_state = self.apply_state(raw_new_state, embodiment_tag)
+        processed_action = self._normalize_action_dict(action, embodiment_tag)
+        return processed_state, processed_action
+
     def unapply(
         self,
         state: dict[str, np.ndarray],
@@ -690,6 +816,58 @@ class StateActionProcessor:
 
         abs_action = rel_action.to_absolute_chunking(reference_frame=reference_frame)
         return abs_action.to(action_format)
+
+    def _reverse_relative_action(
+        self,
+        action: np.ndarray,
+        reference_state: np.ndarray,
+        action_type: ActionType,
+        action_format: ActionFormat,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Given an absolute action chunk and the reference state it starts from,
+        derive the chronologically-reversed ("undo") relative action chunk plus
+        the new reference state it composes from.
+
+        Args:
+            action: Absolute action chunk, shape (T, D) (same contract as
+                `_convert_to_relative_action`'s `action` argument).
+            reference_state: Raw reference state, shape (D,) (the state this
+                chunk starts from, i.e. state_t).
+            action_type: EEF or NON_EEF - determines Pose/ActionChunk subclass.
+            action_format: The array format of both `action` and `reference_state`.
+
+        Returns:
+            Tuple of (reversed_relative_action, new_reference_state):
+                - reversed_relative_action: (T, D) relative chunk, relative to
+                  new_reference_state, that composes back onto new_reference_state
+                  to recover reference_state at its last step.
+                - new_reference_state: (D,) this chunk's own composed absolute
+                  endpoint (state_{t+H}), same raw format as reference_state.
+        """
+        assert action.ndim == 2, f"Expected action shape (T, D), got {action.shape}"
+        assert reference_state.ndim == 1, f"Expected state shape (D,), got {reference_state.shape}"
+
+        if action_type == ActionType.EEF:
+            chunk_cls = EndEffectorActionChunk
+            absolute_chunking = EndEffectorActionChunk.from_array(action, action_format)
+            reference_frame = EndEffectorPose.from_action_format(reference_state, action_format)
+
+        elif action_type == ActionType.NON_EEF:
+            chunk_cls = JointActionChunk
+            absolute_chunking = JointActionChunk([JointPose(m) for m in action])
+            reference_frame = JointPose(reference_state)
+
+        else:
+            raise ValueError(f"Unknown ActionType: {action_type}")
+
+        relative_chunking = absolute_chunking.relative_chunking(reference_frame=reference_frame)
+        reversed_chunking, new_reference_frame = relative_chunking.to_reversed_chunking(
+            reference_frame
+        )
+
+        new_reference_state = chunk_cls([new_reference_frame]).to(action_format)[0]
+        return reversed_chunking.to(action_format), new_reference_state
 
     def __str__(self) -> str:
         return f"StateActionProcessor(modality_configs={self.modality_configs}, statistics={self.statistics}, use_percentiles={self.use_percentiles}, clip_outliers={self.clip_outliers}, apply_sincos_state_encoding={self.apply_sincos_state_encoding}, use_relative_action={self.use_relative_action})"

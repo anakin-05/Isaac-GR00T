@@ -89,6 +89,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
+                enable_direction_conditioning=self.config.model.enable_direction_conditioning,
+                backward_loss_weight=self.config.model.backward_loss_weight,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -103,9 +105,21 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     )
                 logging.info("mask_token not in checkpoint - initialized")
 
+            # Round-trip consistency: direction_embedding is new (see Gr00tN1d7Config
+            # .enable_direction_conditioning). It is already zero-initialized in
+            # DiT.__init__ (an exact no-op), so this is defense-in-depth confirmation
+            # rather than a strict requirement.
+            direction_emb_missing = any("direction_embedding" in key for key in missing_keys)
+            if direction_emb_missing:
+                with torch.no_grad():
+                    model.action_head.model.direction_embedding.weight.zero_()
+                logging.info("direction_embedding not in checkpoint - zero-initialized (no-op)")
+
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            other_missing = [
+                k for k in missing_keys if "mask_token" not in k and "direction_embedding" not in k
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
@@ -180,6 +194,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                # Round-trip consistency overrides
+                enable_direction_conditioning=self.model_config.enable_direction_conditioning,
+                p_backward=self.model_config.p_backward,
+                vision_dropout_prob_backward=self.model_config.vision_dropout_prob_backward,
                 **self.transformers_loading_kwargs,
             )
         else:
@@ -209,6 +227,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                # Round-trip consistency
+                enable_direction_conditioning=self.model_config.enable_direction_conditioning,
+                p_backward=self.model_config.p_backward,
+                vision_dropout_prob_backward=self.model_config.vision_dropout_prob_backward,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
 

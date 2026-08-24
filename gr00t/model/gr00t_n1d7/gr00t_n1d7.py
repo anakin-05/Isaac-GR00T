@@ -172,8 +172,22 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
-    def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
+    def process_backbone_output(
+        self, backbone_output: BatchFeature, drop_vision: torch.Tensor | None = None
+    ) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
+
+        # Round-trip consistency: zero out image-token conditioning for rows flagged
+        # `drop_vision` (used to train/query the backward direction without a real
+        # future camera frame - see Gr00tN1d7Config.vision_dropout_prob_backward).
+        # Reuses the already-computed image_mask; mirrors the state_dropout_prob
+        # zeroing idiom below. The image itself is still encoded normally by the
+        # backbone (compute unchanged) - only its embedding is masked before the DiT.
+        if drop_vision is not None and drop_vision.any():
+            image_mask = backbone_output["image_mask"]
+            zero_pos = drop_vision[:, None] & image_mask
+            backbone_features = backbone_features.masked_fill(zero_pos.unsqueeze(-1), 0.0)
+
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
@@ -200,7 +214,14 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
-        backbone_output = self.process_backbone_output(backbone_output)
+        # Round-trip consistency: direction (0=forward, 1=backward) and vision-dropout
+        # flags, if present in the batch (added by Gr00tN1d7Processor when
+        # enable_direction_conditioning is on). Both default to "off" so existing
+        # (forward-only) batches/checkpoints are completely unaffected.
+        direction = action_input.get("direction")
+        drop_vision = action_input.get("drop_vision")
+
+        backbone_output = self.process_backbone_output(backbone_output, drop_vision=drop_vision)
 
         # Get vision and language embeddings.
         vl_embeds = backbone_output.backbone_features
@@ -259,6 +280,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
+                direction=direction,
             )
         else:
             model_output, _ = self.model(
@@ -267,6 +289,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 encoder_attention_mask=vl_attn_mask,
                 timestep=t_discretized,
                 return_all_hidden_states=True,
+                direction=direction,
             )
 
         pred = self.action_decoder(model_output, embodiment_id)
@@ -275,18 +298,50 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
-        return {
-            "loss": loss,
+        out = {
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
 
+        if direction is not None:
+            # Weight backward-direction rows by backward_loss_weight. Algebraically
+            # identical to the plain sum()/sum() reduction below whenever
+            # backward_loss_weight==1.0 or no row has direction==1 (i.e. whenever
+            # enable_direction_conditioning is off) - see
+            # test_forward_direction_conditioning_disabled_is_bit_identical.
+            is_backward = (direction == 1)[:, None, None].to(dtype=action_loss.dtype)
+            weight = 1.0 + is_backward * (self.config.backward_loss_weight - 1.0)
+            weighted_action_loss = action_loss * weight
+            weighted_mask = action_mask * weight
+            loss = weighted_action_loss.sum() / (weighted_mask.sum() + 1e-6)
+
+            per_example_denom = action_mask.sum(dim=(1, 2)) + 1e-6
+            per_example_loss = action_loss.sum(dim=(1, 2)) / per_example_denom
+            fwd_rows, bwd_rows = direction == 0, direction == 1
+            out["forward_action_loss"] = (
+                per_example_loss[fwd_rows].mean()
+                if fwd_rows.any()
+                else torch.tensor(float("nan"), device=loss.device)
+            )
+            out["backward_action_loss"] = (
+                per_example_loss[bwd_rows].mean()
+                if bwd_rows.any()
+                else torch.tensor(float("nan"), device=loss.device)
+            )
+        else:
+            loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+
+        out["loss"] = loss
+        return out
+
     def _encode_features(
-        self, backbone_output: BatchFeature, action_input: BatchFeature
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        drop_vision: torch.Tensor | None = None,
     ) -> BatchFeature:
         """
         Encode features for the action head.
@@ -298,13 +353,16 @@ class Gr00tN1d7ActionHead(nn.Module):
             action_input: Input containing:
                 - state: [B, state_history_length, max_state_dim]
                 - embodiment_id: [B] (embodiment IDs)
+            drop_vision: Optional [B] bool tensor; round-trip consistency's backward
+                direction is queried with vision conditioning dropped (see
+                Gr00tN1d7ActionHead.process_backbone_output).
 
         Returns:
             BatchFeature containing:
                 - backbone_features: [B, seq_len, backbone_embedding_dim]
                 - state_features: [B, 1, input_embedding_dim]
         """
-        backbone_output = self.process_backbone_output(backbone_output)
+        backbone_output = self.process_backbone_output(backbone_output, drop_vision=drop_vision)
 
         # Get vision and language embeddings.
         vl_embeds = backbone_output.backbone_features
@@ -346,6 +404,14 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
+
+        # Round-trip consistency: direction (0=forward, 1=backward), read from options
+        # the same way the RTC (rtc_overlap_steps etc.) parameters below are. Accepts
+        # either a [B] tensor or a plain int/bool broadcast to the whole batch.
+        direction = options.get("direction") if options is not None else None
+        if direction is not None and not torch.is_tensor(direction):
+            direction = torch.full((batch_size,), int(direction), dtype=torch.long, device=device)
+
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, self.action_dim),
             dtype=vl_embeds.dtype,
@@ -420,12 +486,14 @@ class Gr00tN1d7ActionHead(nn.Module):
                     timestep=timesteps_tensor,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    direction=direction,
                 )
             else:
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
+                    direction=direction,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
@@ -464,7 +532,12 @@ class Gr00tN1d7ActionHead(nn.Module):
             BatchFeature containing:
                 - action_pred: [B, action_horizon, action_dim] predicted actions
         """
-        features = self._encode_features(backbone_output, action_input)
+        drop_vision = options.get("drop_vision") if options is not None else None
+        if drop_vision is not None and not torch.is_tensor(drop_vision):
+            batch_size = backbone_output["backbone_features"].shape[0]
+            device = backbone_output["backbone_features"].device
+            drop_vision = torch.full((batch_size,), bool(drop_vision), dtype=torch.bool, device=device)
+        features = self._encode_features(backbone_output, action_input, drop_vision=drop_vision)
         return self.get_action_with_features(
             backbone_features=features.backbone_features,
             state_features=features.state_features,

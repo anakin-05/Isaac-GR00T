@@ -26,6 +26,10 @@ from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.utils import parse_observation_gr00t
 from gr00t.eval._horizon_contract import PolicyHorizonSpec, migrate_deprecated_action_horizon_argv
+from gr00t.eval.round_trip_consistency import (
+    compute_round_trip_consistency,
+    plot_round_trip_consistency,
+)
 from gr00t.policy import BasePolicy
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.server_client import PolicyClient
@@ -272,6 +276,17 @@ class ArgsConfig:
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
 
+    compute_round_trip_consistency: bool = False
+    """If True, also compute the round-trip consistency (C_i) diagnostic for each
+    trajectory (requires a checkpoint trained with --enable-direction-conditioning)."""
+
+    rtc_depths: list[int] = field(default_factory=lambda: [1, 2, 4])
+    """Rollout depths (in units of action-chunk executions) at which to compute C_i."""
+
+    rtc_save_plot_path: str | None = None
+    """Path to save the C_i-vs-depth plot to. If None, derived from save_plot_path
+    (or the default /tmp/open_loop_eval/ location) with a "_rtc" suffix per trajectory."""
+
 
 def main(args: ArgsConfig):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
@@ -354,6 +369,33 @@ def main(args: ArgsConfig):
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
         all_mae.append(mae)
+
+        if args.compute_round_trip_consistency:
+            rtc_results = compute_round_trip_consistency(
+                policy,
+                dataset,
+                traj_id,
+                args.embodiment_tag,
+                depths=args.rtc_depths,
+                steps=args.steps,
+            )
+            for depth, result in rtc_results.items():
+                logging.info(
+                    "Round-trip consistency C_%d for trajectory %d: mean=%.6g std=%.6g (n=%d)",
+                    depth,
+                    traj_id,
+                    result.c_i.mean(),
+                    result.c_i.std(),
+                    len(result.c_i),
+                )
+            rtc_save_path = args.rtc_save_plot_path or (
+                f"/tmp/open_loop_eval/traj_{traj_id}_rtc.png"
+                if args.save_plot_path is None
+                else str(Path(args.save_plot_path).with_name(
+                    Path(args.save_plot_path).stem + f"_traj{traj_id}_rtc.png"
+                ))
+            )
+            plot_round_trip_consistency(rtc_results, traj_id, rtc_save_path)
 
     if all_mse:
         avg_mse = np.mean(np.array(all_mse))

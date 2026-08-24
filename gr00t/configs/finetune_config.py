@@ -196,6 +196,32 @@ class FinetuneConfig:
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
+    gradient_checkpointing: bool = False
+    """If True, trade compute for memory by recomputing activations during the
+    backward pass instead of storing them. Useful to fit full-parameter
+    finetuning of the diffusion model/projector on a single ~32GB GPU."""
+
+    # --- Round-Trip Consistency ---
+    enable_direction_conditioning: bool = False
+    """If True, adds a direction-conditioned (forward/backward) DiT and trains on
+    a mix of forward and analytically-derived backward action-chunk examples,
+    enabling the round-trip consistency (C_i) test-time diagnostic. Off by
+    default: a no-op that leaves existing checkpoints/workflows unaffected."""
+
+    p_backward: float = 0.5
+    """Per-example probability of sampling a backward (direction=1) example
+    during training, when enable_direction_conditioning is True."""
+
+    vision_dropout_prob_backward: float = 1.0
+    """Probability of dropping vision conditioning on backward examples during
+    training (no real future camera frame is loaded at train time - see plan
+    caveats). Only used when enable_direction_conditioning is True."""
+
+    backward_loss_weight: float = 1.0
+    """Weight applied to the flow-matching loss on backward-direction examples,
+    relative to forward examples (weight 1.0). Only used when
+    enable_direction_conditioning is True."""
+
     def __post_init__(self) -> None:
         if self.gradient_accumulation_steps < 1:
             raise ValueError(

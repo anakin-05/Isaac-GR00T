@@ -70,6 +70,13 @@ class Gr00tN1d7Config(PretrainedConfig):
     use_percentiles: bool = True
     use_relative_action: bool = False
 
+    # Round-trip consistency (bidirectional direction conditioning) parameters.
+    # All default to a no-op configuration so existing checkpoints/workflows are unaffected.
+    enable_direction_conditioning: bool = False  # Adds a direction-conditioned DiT + backward examples
+    p_backward: float = 0.5  # Per-example probability of sampling a backward (direction=1) example
+    vision_dropout_prob_backward: float = 1.0  # Prob. of dropping vision conditioning on backward examples
+    backward_loss_weight: float = 1.0  # Weight applied to the flow-matching loss on backward examples
+
     # Action head configuration parameters
     max_state_dim: int = 132  # Default from state_shape
     max_action_dim: int = 132  # Default from action_shape

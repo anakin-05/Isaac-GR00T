@@ -159,6 +159,45 @@ class ActionChunk(Generic[PoseType]):
         """
         raise NotImplementedError("Subclasses must implement to_absolute_chunking")
 
+    def to_reversed_chunking(
+        self, reference_frame: PoseType
+    ) -> "tuple[ActionChunk[PoseType], PoseType]":
+        """
+        Construct the chronologically-reversed ("undo") action chunking.
+
+        `self` is treated as a RELATIVE chunking (as returned by `relative_chunking`),
+        i.e. relative to `reference_frame`, representing the path
+        P_0=reference_frame -> P_1 -> ... -> P_H. This returns
+        `(reversed_chunk, new_reference_frame)` where `new_reference_frame` = P_H (this
+        chunking's own endpoint, composed via `to_absolute_chunking`) and `reversed_chunk`
+        is relative to `new_reference_frame`, walking backward through
+        P_{H-1}, ..., P_0 in that order, such that:
+
+            reversed_chunk.to_absolute_chunking(new_reference_frame).poses[-1]
+                == reference_frame   (exact, up to floating point rounding)
+
+        This is a pure re-composition of the existing `to_absolute_chunking` /
+        `relative_chunking` primitives - it requires no new per-PoseType math and is
+        automatically correct for any `ActionChunk` subclass (e.g. `JointActionChunk`,
+        `EndEffectorActionChunk`).
+
+        Args:
+            reference_frame: The reference pose this (relative) chunking is defined
+                against, i.e. the pose that this chunking's own P_0 corresponds to.
+
+        Returns:
+            A tuple of (reversed relative chunking, new reference frame = this
+            chunking's absolute endpoint).
+        """
+        absolute = self.to_absolute_chunking(reference_frame)  # [P_1, ..., P_H]
+        full_poses: List[PoseType] = [reference_frame] + absolute.poses  # [P_0, ..., P_H]
+        reversed_poses = list(reversed(full_poses))  # [P_H, ..., P_0]
+        new_reference_frame = reversed_poses[0]
+        trailing_poses = reversed_poses[1:]  # [P_{H-1}, ..., P_0], H poses
+        trailing_chunk = self.__class__(trailing_poses, times=self.times)
+        reversed_chunk = trailing_chunk.relative_chunking(reference_frame=new_reference_frame)
+        return reversed_chunk, new_reference_frame
+
     def interpolate(
         self,
         num_points: Optional[int] = None,

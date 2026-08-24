@@ -244,6 +244,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Normalization
         use_mean_std: bool = False,
         letter_box_transform: bool = False,
+        # Round-trip consistency
+        enable_direction_conditioning: bool = False,
+        p_backward: float = 0.5,
+        vision_dropout_prob_backward: float = 1.0,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
 
@@ -270,6 +274,11 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.state_dropout_prob = state_dropout_prob
 
         self.letter_box_transform = letter_box_transform
+
+        # Round-trip consistency settings
+        self.enable_direction_conditioning = enable_direction_conditioning
+        self.p_backward = p_backward
+        self.vision_dropout_prob_backward = vision_dropout_prob_backward
 
         # Save VLM settings
         self.formalize_language = formalize_language
@@ -587,12 +596,30 @@ class Gr00tN1d7Processor(BaseProcessor):
         action_data = content.actions
         state_data = content.states
 
-        # Use StateActionProcessor to handle relative conversion and normalization
-        norm_state_dict, normalized_actions = self.state_action_processor.apply(
-            state=state_data,
-            action=action_data,
-            embodiment_tag=embodiment_tag.value,
+        # Round-trip consistency: with probability p_backward (training only), derive a
+        # BACKWARD (direction=1) example instead of the usual forward one, using the
+        # same (state_data, action_data) already extracted above - no new I/O. See
+        # StateActionProcessor.apply_reversed / Gr00tN1d7Config.enable_direction_conditioning.
+        is_backward = (
+            self.enable_direction_conditioning
+            and self.training
+            and bool(action_data)
+            and random.random() < self.p_backward
         )
+
+        # Use StateActionProcessor to handle relative conversion and normalization
+        if is_backward:
+            norm_state_dict, normalized_actions = self.state_action_processor.apply_reversed(
+                state=state_data,
+                action=action_data,
+                embodiment_tag=embodiment_tag.value,
+            )
+        else:
+            norm_state_dict, normalized_actions = self.state_action_processor.apply(
+                state=state_data,
+                action=action_data,
+                embodiment_tag=embodiment_tag.value,
+            )
 
         if normalized_actions:
             # Concatenate actions
@@ -698,6 +725,13 @@ class Gr00tN1d7Processor(BaseProcessor):
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+
+        # Round-trip consistency: always emit direction/drop_vision (never
+        # conditionally) - the collator stacks each key only over examples that
+        # have it, so a sometimes-present key would silently misalign the batch.
+        transformed_inputs["direction"] = np.array(1 if is_backward else 0, dtype=np.int64)
+        drop_vision = is_backward and (random.random() < self.vision_dropout_prob_backward)
+        transformed_inputs["drop_vision"] = np.array(drop_vision, dtype=np.bool_)
         return transformed_inputs
 
     def _get_vlm_inputs(
@@ -788,6 +822,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 # State augmentation
                 "exclude_state": self.exclude_state,
                 "state_dropout_prob": self.state_dropout_prob,
+                # Round-trip consistency
+                "enable_direction_conditioning": self.enable_direction_conditioning,
+                "p_backward": self.p_backward,
+                "vision_dropout_prob_backward": self.vision_dropout_prob_backward,
             },
         }
         with open(main_config_file, "w") as f:
@@ -858,6 +896,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
+        processor_kwargs.setdefault("enable_direction_conditioning", False)
+        processor_kwargs.setdefault("p_backward", 0.5)
+        processor_kwargs.setdefault("vision_dropout_prob_backward", 1.0)
 
         # Directly override other processor kwargs
         if kwargs:
@@ -877,6 +918,9 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
+                "enable_direction_conditioning",
+                "p_backward",
+                "vision_dropout_prob_backward",
             ]
             for key in override_keys:
                 if key in kwargs:

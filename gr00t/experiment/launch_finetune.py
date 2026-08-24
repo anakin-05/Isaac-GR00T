@@ -101,6 +101,12 @@ if __name__ == "__main__":
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
+    # Round-trip consistency (off by default - see FinetuneConfig).
+    config.model.enable_direction_conditioning = ft_config.enable_direction_conditioning
+    config.model.p_backward = ft_config.p_backward
+    config.model.vision_dropout_prob_backward = ft_config.vision_dropout_prob_backward
+    config.model.backward_loss_weight = ft_config.backward_loss_weight
+
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"
@@ -126,5 +132,6 @@ if __name__ == "__main__":
     config.training.save_only_model = ft_config.save_only_model
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.skip_weight_loading = ft_config.skip_weight_loading
+    config.training.gradient_checkpointing = ft_config.gradient_checkpointing
 
     run(config)

@@ -255,6 +255,13 @@ class DiT(ModelMixin, ConfigMixin):
             embedding_dim=self.inner_dim, compute_dtype=self.compute_dtype
         )
 
+        # Direction conditioning (round-trip consistency): a 2-row embedding (0=forward,
+        # 1=backward) summed into `temb`, reaching every block via the same AdaLN path as the
+        # flow-matching timestep. Zero-initialized so this is an exact no-op until trained -
+        # existing (forward-only) checkpoints and workflows are completely unaffected.
+        self.direction_embedding = nn.Embedding(2, self.inner_dim)
+        nn.init.zeros_(self.direction_embedding.weight)
+
         all_blocks = []
         for idx in range(self.config.num_layers):
             use_self_attn = idx % 2 == 1 and interleave_self_attention
@@ -296,9 +303,15 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        direction: Optional[torch.LongTensor] = None,
     ):
         # Encode timesteps
-        temb = self.timestep_encoder(timestep)
+        dir_idx = (
+            direction
+            if direction is not None
+            else torch.zeros(hidden_states.shape[0], dtype=torch.long, device=hidden_states.device)
+        )
+        temb = self.timestep_encoder(timestep) + self.direction_embedding(dir_idx)
 
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
@@ -355,11 +368,17 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        direction: Optional[torch.LongTensor] = None,
     ):
         assert image_mask is not None, "Image mask is required"
 
         # Encode timesteps
-        temb = self.timestep_encoder(timestep)
+        dir_idx = (
+            direction
+            if direction is not None
+            else torch.zeros(hidden_states.shape[0], dtype=torch.long, device=hidden_states.device)
+        )
+        temb = self.timestep_encoder(timestep) + self.direction_embedding(dir_idx)
 
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
