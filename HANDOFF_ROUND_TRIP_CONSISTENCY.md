@@ -173,6 +173,64 @@ uv run python gr00t/eval/open_loop_eval.py \
 (episode 0 has an empty language instruction — use `--traj-ids 1 2`, per
 `examples/DROID/README.md`.)
 
+## Not started — closed-loop evaluation (LIBERO, RoboCasa, RoboLab)
+
+Everything above is **offline/open-loop only** (`open_loop_eval.py` replays a recorded
+trajectory, no live env). LIBERO, RoboCasa (+ RoboCasa GR1 Tabletop), and RoboLab all
+evaluate **closed-loop** (policy-in-the-loop via the server-client architecture), which
+none of the current code reaches. Full design is now in the plan file's new "Extension:
+Closed-Loop Evaluation" section — this is a summary; **no code has been written for this
+yet**.
+
+### The key finding: one mechanism can't cover all three
+
+- **LIBERO / RoboCasa / RoboCasa-GR1-Tabletop** all route through this repo's own
+  `gr00t/eval/rollout_policy.py` against `gr00t/eval/run_gr00t_server.py` — same client
+  shape, only `--model-path`/`--embodiment-tag`/`--env-name` differ per benchmark. We
+  control this client.
+- **RoboLab** is a *separate GitHub repo* (`NVlabs/RoboLab`, not part of Isaac-GR00T, not
+  checked out here) with its own Isaac Sim/Isaac Lab rollout loop
+  (`policies/gr00t/run.py`) that talks to the *same* `run_gr00t_server.py` over the same
+  `get_action` protocol, using `--open-loop-horizon 8` as its execution-horizon
+  equivalent. We do **not** control that client's source.
+
+So reaching RoboLab requires a **server-side** diagnostic (transparent to whatever client
+is calling it) — a client-side hook in `rollout_policy.py` alone would cover LIBERO/RoboCasa
+but structurally cannot reach RoboLab.
+
+### Two complementary mechanisms designed (neither implemented yet)
+
+1. **Server-side `RoundTripMonitor`** (new `gr00t/policy/round_trip_monitor.py`, wired into
+   `gr00t/eval/run_gr00t_server.py` via new flags) — wraps any policy, and every N
+   `get_action` calls (default 8, matching every benchmark's `--n-action-steps 8` /
+   `--open-loop-horizon 8` convention) also issues one internal backward-direction query,
+   logging $\mathcal{C}_i$ to a JSONL sidecar. Works for **all four** benchmarks with zero
+   client changes, since `options` already forwards transparently through
+   `PolicyServer`/`Gr00tPolicy`/`Gr00tSimPolicyWrapper` today (verified, no code change
+   needed there).
+2. **Client-side hook in `gr00t/eval/rollout_policy.py`** (`_collect_rollout_episodes`) —
+   richer for LIBERO/RoboCasa/RoboCasa-GR1 specifically, since it ties $\mathcal{C}_i$
+   directly to each episode's task/success via the same `episode_infos` sink
+   `task_progress`/`q_score` already use. Cannot reach RoboLab (external client).
+
+Recommendation: build the server-side one first (it's the one that actually reaches
+RoboLab); add the client-side one on top for richer LIBERO/RoboCasa reporting.
+
+### What's needed to actually implement and verify this
+
+- The code changes themselves (see the plan file for exact file list/signatures) —
+  straightforward given the existing `options`-forwarding plumbing, but untouched so far.
+- **A sim environment for at least one of LIBERO/RoboCasa** to verify Mechanism 2 for
+  real (`gr00t/eval/sim/LIBERO/setup_libero.sh` or `gr00t/eval/sim/robocasa/setup_RoboCasa.sh`)
+  — not installed in this environment. CPU-safe unit tests (mocked policy/env, no sim) can
+  and should still be written and pass without this.
+- **RoboLab itself** (a separate `git clone https://github.com/NVlabs/RoboLab`, its own
+  Isaac Sim/Isaac Lab install) to verify Mechanism 1 against a real RoboLab client — also
+  not available here. Mechanism 1's unit tests don't need it either (mocked policy).
+- Note this is a **separate environment dependency from the GPU fine-tune blocker above** —
+  a bigger GPU alone doesn't unblock this; LIBERO/RoboCasa need their sim setup scripts run,
+  RoboLab needs its own separate repo/Isaac Sim install.
+
 ## Caveats (unchanged from the original plan — still apply)
 
 3 demo episodes is a plumbing validation, not a calibrated signal; gripper "inversion" is
