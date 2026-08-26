@@ -289,14 +289,15 @@ above. `--no-tune-projector` was never actually needed once on a ≥40 GB GPU �
 (DROID, 1000-step real fine-tune) and batch 32 (LIBERO, real 40658-step fine-tune, see
 below) both fit comfortably with the default `tune_projector=True`.
 
-## Not started — closed-loop evaluation (LIBERO, RoboCasa, RoboLab)
+## Done (Mechanism 1) — closed-loop evaluation extension, LIBERO benchmarked
 
-Everything above is **offline/open-loop only** (`open_loop_eval.py` replays a recorded
-trajectory, no live env). LIBERO, RoboCasa (+ RoboCasa GR1 Tabletop), and RoboLab all
-evaluate **closed-loop** (policy-in-the-loop via the server-client architecture), which
-none of the current code reaches. Full design is now in the plan file's new "Extension:
-Closed-Loop Evaluation" section — this is a summary; **no code has been written for this
-yet**.
+Everything in the "Done" sections above is **offline/open-loop only** (`open_loop_eval.py`
+replays a recorded trajectory, no live env). LIBERO, RoboCasa (+ RoboCasa GR1 Tabletop), and
+RoboLab all evaluate **closed-loop** (policy-in-the-loop via the server-client
+architecture). Mechanism 1 (below) is now implemented, tested, and verified against a real
+LIBERO closed-loop benchmark; Mechanism 2 (the richer, LIBERO/RoboCasa-only client-side
+hook) is not implemented — Mechanism 1 alone was sufficient for the benchmark requested,
+and reaches RoboLab too, which Mechanism 2 structurally cannot.
 
 ### The key finding: one mechanism can't cover all three
 
@@ -314,38 +315,133 @@ So reaching RoboLab requires a **server-side** diagnostic (transparent to whatev
 is calling it) — a client-side hook in `rollout_policy.py` alone would cover LIBERO/RoboCasa
 but structurally cannot reach RoboLab.
 
-### Two complementary mechanisms designed (neither implemented yet)
+### Mechanism 1 — implemented, tested, verified live
 
-1. **Server-side `RoundTripMonitor`** (new `gr00t/policy/round_trip_monitor.py`, wired into
-   `gr00t/eval/run_gr00t_server.py` via new flags) — wraps any policy, and every N
-   `get_action` calls (default 8, matching every benchmark's `--n-action-steps 8` /
-   `--open-loop-horizon 8` convention) also issues one internal backward-direction query,
-   logging $\mathcal{C}_i$ to a JSONL sidecar. Works for **all four** benchmarks with zero
-   client changes, since `options` already forwards transparently through
-   `PolicyServer`/`Gr00tPolicy`/`Gr00tSimPolicyWrapper` today (verified, no code change
-   needed there).
-2. **Client-side hook in `gr00t/eval/rollout_policy.py`** (`_collect_rollout_episodes`) —
-   richer for LIBERO/RoboCasa/RoboCasa-GR1 specifically, since it ties $\mathcal{C}_i$
-   directly to each episode's task/success via the same `episode_infos` sink
-   `task_progress`/`q_score` already use. Cannot reach RoboLab (external client).
+**New `gr00t/policy/round_trip_monitor.py`** — `RoundTripMonitor(PolicyWrapper)` wraps any
+`BasePolicy` (works with either `Gr00tPolicy`'s nested observation format or
+`Gr00tSimPolicyWrapper`'s flat one, auto-detected). Every `round_trip_check_interval`
+`get_action` calls, for each env-batch slot, issues one internal backward-direction query
+(`options={"direction": 1, "drop_vision": True}`) anchored on the *current* observation,
+decodes the reconstructed past state (reusing the same "collapse leading dims, take the
+last row" fix from `round_trip_consistency.py` above — this module hits the exact same
+`(H, D)` vs. real-policy `(B, H, D)` shape ambiguity), and diffs it against a cached true
+state from `depth` calls ago, logging to a JSONL sidecar. Skips the backward query
+entirely when no requested depth has a cached target yet (early in a rollout) — a
+real-cost-aware optimization beyond what the plan specified. Wired into
+`gr00t/eval/run_gr00t_server.py` via `--enable-round-trip-monitor`,
+`--round-trip-check-interval`, `--round-trip-depths`, `--round-trip-log-path`; wrapping
+happens *after* `--use-sim-policy-wrapper` so it sits outermost, transparent to whatever
+client is talking to the server (verified: `options` already forwards end-to-end through
+`PolicyServer` → `Gr00tPolicy`/`Gr00tSimPolicyWrapper`, no server/RPC changes needed). New
+tests: `tests/gr00t/policy/test_round_trip_monitor.py` (6 tests, mocked `BasePolicy`,
+CPU-safe — interval/depth bookkeeping, multi-env-slot independence, exact-recovery at
+depth 1, reset-clears-history, and failure isolation: a round-trip check that raises
+never breaks real closed-loop control). New README subsection:
+`examples/LIBERO/README.md`'s "Round-trip consistency monitoring".
 
-Recommendation: build the server-side one first (it's the one that actually reaches
-RoboLab); add the client-side one on top for richer LIBERO/RoboCasa reporting.
+**Mechanism 2** (client-side hook in `gr00t/eval/rollout_policy.py`, richer per-episode
+$\mathcal{C}_i$ for LIBERO/RoboCasa/RoboCasa-GR1 specifically) — **not implemented.**
+Mechanism 1 alone was sufficient for the benchmark below and reaches RoboLab too, which
+Mechanism 2 structurally cannot; revisit if per-episode/per-task $\mathcal{C}_i$
+correlation becomes the priority (see Caveat below on why this benchmark didn't exercise
+that correlation).
 
-### What's needed to actually implement and verify this
+### LIBERO Goal closed-loop benchmark: RTC vs. baseline (real sim, real rollouts)
 
-- The code changes themselves (see the plan file for exact file list/signatures) —
-  straightforward given the existing `options`-forwarding plumbing, but untouched so far.
-- **A sim environment for at least one of LIBERO/RoboCasa** to verify Mechanism 2 for
-  real (`gr00t/eval/sim/LIBERO/setup_libero.sh` or `gr00t/eval/sim/robocasa/setup_RoboCasa.sh`)
-  — not installed in this environment. CPU-safe unit tests (mocked policy/env, no sim) can
-  and should still be written and pass without this.
-- **RoboLab itself** (a separate `git clone https://github.com/NVlabs/RoboLab`, its own
-  Isaac Sim/Isaac Lab install) to verify Mechanism 1 against a real RoboLab client — also
-  not available here. Mechanism 1's unit tests don't need it either (mocked policy).
-- Note this is a **separate environment dependency from the GPU fine-tune blocker above** —
-  a bigger GPU alone doesn't unblock this; LIBERO/RoboCasa need their sim setup scripts run,
-  RoboLab needs its own separate repo/Isaac Sim install.
+Ran the full LIBERO Goal suite (10 tasks) closed-loop, 10 episodes/task, 5 parallel envs,
+720 max steps, 8 action steps — for both `examples/LIBERO/logs/libero-rtc/libero_goal-rtc`
+(this integration's RTC-enabled fine-tune, checkpoint-40658) and a same-recipe non-RTC
+baseline (`Isaac-GR00T-base_line/examples/LIBERO/logs/libero-base_line/libero_goal`, a
+separate checkout on this machine), via:
+
+```bash
+# Server (repeat per checkpoint; add --enable-round-trip-monitor only for the RTC one)
+uv run python gr00t/eval/run_gr00t_server.py --model-path <checkpoint> \
+    --embodiment-tag LIBERO_PANDA --use-sim-policy-wrapper \
+    --enable-round-trip-monitor --round-trip-log-path /tmp/round_trip_consistency/libero_goal_rtc_benchmark.jsonl
+# Client (repeat per task/env-name, MUJOCO_EGL_DEVICE_ID required - see Caveat)
+MUJOCO_EGL_DEVICE_ID=0 gr00t/eval/sim/LIBERO/libero_uv/.venv/bin/python gr00t/eval/rollout_policy.py \
+    --n-episodes 10 --n-envs 5 --max-episode-steps 720 --n-action-steps 8 \
+    --policy-client-host 127.0.0.1 --policy-client-port <5555-or-5556> \
+    --env-name libero_sim/<task> --video-dir /tmp/<your-own-writable-dir>/<label>
+```
+
+| Task | RTC success | Baseline success |
+|---|---|---|
+| open_the_middle_drawer_of_the_cabinet | 1.0 | 1.0 |
+| put_the_bowl_on_the_stove | 1.0 | 1.0 |
+| put_the_wine_bottle_on_top_of_the_cabinet | 1.0 | 1.0 |
+| open_the_top_drawer_and_put_the_bowl_inside | 1.0 | 1.0 |
+| put_the_bowl_on_top_of_the_cabinet | 1.0 | 1.0 |
+| push_the_plate_to_the_front_of_the_stove | 1.0 | 1.0 |
+| put_the_cream_cheese_in_the_bowl | 1.0 | 1.0 |
+| turn_on_the_stove | 1.0 | 1.0 |
+| put_the_bowl_on_the_plate | 1.0 | 1.0 |
+| put_the_wine_bottle_on_the_rack | 1.0 | 1.0 |
+| **Overall (100 episodes each)** | **1.0** | **1.0** |
+
+**Headline finding: identical, perfect closed-loop success (100/100 episodes) for both
+checkpoints.** This directly answers the question this benchmark was built to answer —
+**adding round-trip-consistency training (direction conditioning + backward examples) does
+not measurably hurt forward-task closed-loop performance** on LIBERO Goal, at least at this
+scale. It's a ceiling result, though: LIBERO Goal is close to solved by this model class
+already (the repo's own reported baseline is 97.5%), so this comparison couldn't have shown
+RTC *helping* task success either — a harder/noisier benchmark would be needed to see
+whether RTC's C_i-guided trust signal (its actual purpose) ever changes an executed
+behavior, since nothing here ever needed to distrust a chunk.
+
+**Round-trip diagnostic data collected during the RTC run**: 600 rows total across the
+benchmark (`/tmp/round_trip_consistency/libero_goal_rtc_benchmark.jsonl`).
+$\mathcal{C}_i$ was flat across depths (mean 1.265 / 1.264 / 1.277 for depths 1/2/4 —
+similar to the open-loop LIBERO eval's flat-with-depth pattern above, unlike DROID's
+monotonic rise). Per-key breakdown: `roll` dominates by roughly an order of magnitude
+(mean MSE 6.65) over every other channel (`pitch` 0.76, `yaw` 0.16, `z` 0.04, `x`/`y`
+~0.005) — worth a closer look before trusting an aggregate $\mathcal{C}_i$ for this
+embodiment, but out of scope to chase further here. **Because both checkpoints hit 100%
+success everywhere, this run has zero failure cases to correlate $\mathcal{C}_i$ against** —
+real diagnostic data was collected end-to-end (validating the mechanism works), but this
+particular benchmark cannot speak to whether $\mathcal{C}_i$ predicts failure, since nothing
+failed. A benchmark with a genuine success/failure mix (a harder task suite, fewer training
+steps, or an out-of-distribution scene) is needed for that question.
+
+### Caveats (closed-loop-specific, found running this for real)
+
+1. **`MUJOCO_EGL_DEVICE_ID` must be set to a plain integer for any `rollout_policy.py`
+   client on this class of machine.** MuJoCo's offscreen EGL renderer parses
+   `CUDA_VISIBLE_DEVICES` as a comma-separated list of integer device indices; on a
+   MIG-enabled host where that variable holds MIG UUID strings (e.g.
+   `MIG-9bd72ea7-...`), `int(x)` raises `ValueError` and the client crashes before ever
+   reaching the server. `robosuite`'s EGL context code checks `MUJOCO_EGL_DEVICE_ID` first
+   — set it to `0` (or whichever physical GPU index has a working display pipeline; MIG's
+   compute partitioning doesn't extend to EGL/OpenGL rendering, so a working index is
+   independent of which MIG slice your compute allocation actually is).
+2. **Shared `/tmp` on a multi-tenant machine breaks two things `robosuite`/
+   `rollout_policy.py` hardcode.** `robosuite.utils.log_utils` unconditionally opens
+   `/tmp/robosuite.log` at import time; if another user already owns that file, import
+   crashes with `PermissionError`. Fixed here by patching the venv's own
+   `robosuite/macros.py` (`FILE_LOGGING_LEVEL = "DEBUG"` → `None`) — a per-venv fix, not
+   a repo change, since `robosuite`'s own `macros_private` override mechanism doesn't
+   actually reach this code path (a known upstream inconsistency: `macros_private`
+   overrides names imported directly into `robosuite`'s namespace, but `log_utils.py`
+   reads `robosuite.macros.FILE_LOGGING_LEVEL` via `import robosuite.macros as macros`,
+   which private-macro overrides never touch). Separately, `rollout_policy.py` defaults
+   `--video-dir` to `/tmp/sim_eval_videos_<env>_<uuid>` — if a directory one level up
+   (`/tmp/sim_eval_videos_<env_prefix>`) already exists and is owned by another user
+   without world-write, `mkdir` fails with the same `PermissionError`. Always pass an
+   explicit `--video-dir` under a path only you own on a shared machine.
+3. **This machine runs a real SLURM job (see the GPU section's cgroup discussion above) at
+   very high load** (observed `uptime` load average ~100-118 on 64 cores while running
+   this benchmark) — server/client startup and rendering were all noticeably slower than
+   the numbers would suggest on a quiet machine; budget accordingly, and don't assume a
+   slow-but-still-progressing process (check `ps -o pid,etimes,time,%cpu` — CPU time
+   should keep advancing) is hung.
+4. **Per-slot `reset()` granularity, flagged as unconfirmed in the plan, is now
+   confirmed**: `gr00t/eval/rollout_policy.py` calls `policy.reset()` exactly once, with no
+   arguments, before the rollout loop begins — it never detects or forwards individual
+   sub-env auto-resets within the vectorized batch. `RoundTripMonitor` clears its entire
+   ring buffer on any `reset()` call, per the plan's documented fallback; a round-trip
+   window spanning an undetected mid-rollout episode boundary is a real but rare
+   (window-length-vs-episode-length) source of noise in the JSONL log, not a crash.
 
 ## Caveats (unchanged from the original plan — still apply)
 

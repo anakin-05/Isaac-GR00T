@@ -46,7 +46,8 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
     the two fixes + their tests, one for the doc updates.
   - Separately, also ran a full-scale (non-plan, additional) real fine-tune on LIBERO with RTC
     enabled at production-scale hyperparameters (40658 steps, batch 32) — **completed all 40658
-    steps**, final checkpoint `examples/LIBERO/logs/libero_rtc/checkpoint-40658`, eval'd
+    steps**, checkpoint since moved by the user to
+    `examples/LIBERO/logs/libero-rtc/libero_goal-rtc` (was `libero_rtc/checkpoint-40658`), eval'd
     (open-loop MSE/MAE + round-trip C_i on 3 trajectories, real numbers in
     `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s "Done: real LIBERO+RTC fine-tune" section). Took 5
     crash/resume cycles from two distinct causes (both diagnosed and documented there): a
@@ -56,17 +57,31 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
     fully eliminated) by cutting `--dataloader-num-workers` 4→2. Worth knowing before launching
     another long unattended run on a similarly shared machine.
 - **Closed-loop evaluation extension (LIBERO / RoboCasa / RoboCasa-GR1-Tabletop / RoboLab):
-  still designed, not implemented.** Full design is in §3 below (also in the plan file, copied
-  verbatim). Zero code written for this yet — unaffected by this session's work, which was all
-  about actually running the already-implemented offline/open-loop path, fixing the two bugs
-  that surfaced from doing so, and running the LIBERO fine-tune to completion.
-- **Last state before this update**: both fixes verified (CPU suite: 738 passed, 9 skipped, same 2
-  pre-existing unrelated environmental failures as always — a stray nested venv under
-  `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a missing
-  `HF_TOKEN` env var for one edge-device test — neither is a regression from this session), Step
-  0/1/2 (droid_sample) and the LIBERO production-scale run both complete with real numbers
-  recorded. **Open decision for the next session, per below, is unchanged** — the closed-loop eval
-  extension is still the next undone piece of the original plan.
+  Mechanism 1 implemented, tested, and benchmarked live against real LIBERO closed-loop
+  rollouts.** New `gr00t/policy/round_trip_monitor.py` (`RoundTripMonitor`), wired into
+  `gr00t/eval/run_gr00t_server.py`, 6 new CPU-safe tests. Full LIBERO Goal benchmark (10 tasks,
+  100 episodes each) comparing the RTC checkpoint (`libero-rtc/libero_goal-rtc`) against a
+  same-recipe non-RTC baseline (`Isaac-GR00T-base_line/examples/LIBERO/logs/libero-base_line/
+  libero_goal`, a separate checkout on this machine) found **identical, perfect 100/100
+  closed-loop success for both** — RTC training doesn't measurably hurt forward-task
+  performance, though this benchmark is a ceiling result (LIBERO Goal is already
+  near-solved) that can't show whether the C_i trust signal itself ever matters, since
+  nothing ever failed. Full results table and 3 real environment gotchas found running
+  this (MuJoCo EGL device parsing, shared-`/tmp` permission collisions, heavy SLURM load)
+  are in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s closed-loop section. **Mechanism 2
+  (client-side hook in `rollout_policy.py`) is still not implemented** — Mechanism 1 alone
+  was sufficient for this benchmark and reaches RoboLab too, which Mechanism 2 structurally
+  cannot; full design for it is still in §3 below if the per-episode/per-task C_i
+  correlation becomes the priority later.
+- **Last state before this update**: both earlier fixes verified (CPU suite: 744 passed, 9
+  skipped, same 2 pre-existing unrelated environmental failures as always — a stray nested venv
+  under `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a
+  missing `HF_TOKEN` env var for one edge-device test — neither is a regression from this
+  session), Step 0/1/2 (droid_sample), the LIBERO production-scale fine-tune, and the LIBERO
+  closed-loop benchmark are all complete with real numbers recorded. **Open decision for the
+  next session**: implement Mechanism 2 if per-episode C_i correlation is wanted, or run a
+  harder/noisier benchmark (to get a genuine success/failure mix) against the existing
+  Mechanism 1 to actually test whether C_i predicts failure — see §5 below.
 
 ## 2. Working agreements from this session (apply these on the new machine too)
 
@@ -267,10 +282,18 @@ from).
 
 ## 5. Open decision for the next session
 
-The GPU fine-tune/eval deferral is resolved (§1 above) — Steps 0-2 (droid_sample) and the LIBERO
-production-scale fine-tune both completed, with two real bugs found and fixed along the way, all
-committed. The only remaining undone piece of the original plan is implementing the closed-loop
-evaluation mechanisms (§3 above) — pick up there. The completed LIBERO checkpoint
-(`examples/LIBERO/logs/libero_rtc/checkpoint-40658`) is a natural first thing to point a
-closed-loop eval at once that mechanism exists, since LIBERO is one of the three benchmarks
-(LIBERO/RoboCasa/RoboCasa-GR1) Mechanism 2 targets directly.
+The GPU fine-tune/eval deferral is resolved (§1 above) — Steps 0-2 (droid_sample), the LIBERO
+production-scale fine-tune, and the LIBERO closed-loop benchmark (Mechanism 1) are all complete,
+with real bugs found and fixed along the way, all committed. The LIBERO Goal benchmark came back
+a clean sweep (100/100 episodes, both RTC and baseline) — a good "doesn't hurt task performance"
+result, but not a test of whether C_i actually predicts failure, since nothing failed. Two
+independent next steps, either order:
+
+1. **Implement Mechanism 2** (§3 above, client-side hook in `rollout_policy.py`) — richer,
+   ties C_i to per-episode/per-task success directly for LIBERO/RoboCasa/RoboCasa-GR1 (not
+   RoboLab, which needs Mechanism 1).
+2. **Run a benchmark that can actually produce failures** — a harder LIBERO suite (10/Long
+   rather than Goal), an earlier/undertrained checkpoint, or an out-of-distribution scene —
+   against the *already-implemented* Mechanism 1, to see whether C_i is higher on the
+   episodes that fail. This is the actual validation the round-trip-consistency mechanism
+   exists for, and nothing in this session's LIBERO Goal sweep could show it either way.
