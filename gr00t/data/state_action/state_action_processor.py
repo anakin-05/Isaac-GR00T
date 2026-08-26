@@ -48,6 +48,28 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# (embodiment_tag, key) pairs already warned about via `_warn_once_dim_mismatch`, so the
+# per-datapoint `apply_reversed` hot path doesn't spam identical warnings every example.
+_WARNED_DIM_MISMATCH_KEYS: set[tuple[str, str]] = set()
+
+
+def _warn_once_dim_mismatch(
+    embodiment_tag: str, key: str, state_key: str, state_dim: int, action_dim: int
+) -> None:
+    cache_key = (embodiment_tag, key)
+    if cache_key in _WARNED_DIM_MISMATCH_KEYS:
+        return
+    _WARNED_DIM_MISMATCH_KEYS.add(cache_key)
+    logger.warning(
+        f"apply_reversed: skipping ABSOLUTE-rep reversal for action key '{key}' in "
+        f"embodiment '{embodiment_tag}' - its reference state key '{state_key}' has dim "
+        f"{state_dim} but the action has dim {action_dim}. These represent different "
+        f"physical quantities that happen to share a name (e.g. a multi-joint gripper "
+        f"state vs. a single-channel gripper command), so no dimension-matched anchor "
+        f"exists for a temporal reversal. This key's action/state are left at their "
+        f"forward-direction values in the backward example instead of crashing."
+    )
+
 
 def _reverse_absolute_action(
     current_value: np.ndarray, forward_array: np.ndarray
@@ -666,6 +688,23 @@ class StateActionProcessor:
                 # ABSOLUTE rep, or RELATIVE rep with use_relative_action disabled -
                 # mirrors apply_action's Step 1 gate, which likewise skips conversion
                 # (and normalizes the raw values directly) in that case.
+                if reference_state.shape[-1] != action[key].shape[-1]:
+                    # E.g. LIBERO_PANDA's "gripper": a 2-dim multi-finger joint state and
+                    # a 1-dim actuation command that happen to share a name but are
+                    # different physical quantities - there's no dimension-matched anchor
+                    # to build a temporal reversal from. Leave this key's forward-direction
+                    # action/state untouched rather than crash (see plan Caveat: gripper
+                    # reversal is already a regression-consistency approximation, not a
+                    # physical-undo claim, so skipping it here is a further instance of
+                    # the same documented limitation, not a new one).
+                    _warn_once_dim_mismatch(
+                        embodiment_tag,
+                        key,
+                        state_key,
+                        reference_state.shape[-1],
+                        action[key].shape[-1],
+                    )
+                    continue
                 reversed_action, new_reference = _reverse_absolute_action(
                     current_value=reference_state, forward_array=action[key]
                 )

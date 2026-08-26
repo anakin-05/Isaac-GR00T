@@ -26,7 +26,13 @@ from pathlib import Path
 from gr00t.data.state_action.action_chunking import EndEffectorActionChunk
 from gr00t.data.state_action.pose import EndEffectorPose
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
-from gr00t.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType, ModalityConfig
+from gr00t.data.types import (
+    ActionConfig,
+    ActionFormat,
+    ActionRepresentation,
+    ActionType,
+    ModalityConfig,
+)
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
@@ -294,6 +300,45 @@ class TestApplyReversedAbsolute:
             np.testing.assert_allclose(
                 raw_backward_action[key][-1], current_value, atol=1e-3, rtol=1e-3
             )
+
+
+class TestApplyReversedDimMismatch:
+    """apply_reversed must not crash when an ABSOLUTE-rep key's action and its
+    reference state key have different dimensions - the plain (unmodified)
+    libero_sim fixture already has exactly this real-world mismatch for
+    "gripper" (2-dim multi-finger state vs. 1-dim actuation command), which is
+    precisely why TestApplyReversedAbsolute above needs
+    `_self_consistent_absolute_setup` to paper over it. This class tests the
+    plain fixture directly instead.
+    """
+
+    def test_dimension_mismatched_key_does_not_raise(self, processor, modality_keys, statistics):
+        state_keys, action_keys = modality_keys
+        raw_state = _random_state(state_keys, statistics)
+        raw_action = _random_action(action_keys, statistics, horizon=4)
+        # Sanity check this fixture actually exercises the mismatch being tested;
+        # if it stops doing so, this test would vacuously pass.
+        assert raw_state["gripper"].shape[-1] != raw_action["gripper"].shape[-1]
+
+        norm_state, norm_action = processor.apply_reversed(raw_state, raw_action, EMBODIMENT)
+        assert set(norm_state.keys()) == set(action_keys)
+        assert set(norm_action.keys()) == set(action_keys)
+
+    def test_dimension_mismatched_key_left_at_forward_values(
+        self, processor, modality_keys, statistics
+    ):
+        state_keys, action_keys = modality_keys
+        raw_state = _random_state(state_keys, statistics)
+        raw_action = _random_action(action_keys, statistics, horizon=4)
+
+        norm_state, norm_action = processor.apply_reversed(raw_state, raw_action, EMBODIMENT)
+        forward_state, forward_action = processor.apply(raw_state, raw_action, EMBODIMENT)
+
+        # The mismatched key is left untouched (same as the forward direction)...
+        np.testing.assert_allclose(norm_action["gripper"], forward_action["gripper"])
+        np.testing.assert_allclose(norm_state["gripper"], forward_state["gripper"])
+        # ...while a dimension-matched key is actually reversed and differs.
+        assert not np.allclose(norm_action["x"], forward_action["x"])
 
 
 # ---------------------------------------------------------------------------

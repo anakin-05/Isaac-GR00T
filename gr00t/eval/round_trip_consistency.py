@@ -206,9 +206,16 @@ def compute_round_trip_consistency(
                 true_val = np.asarray(traj[col].iloc[t]).astype(np.float64).reshape(-1)
                 # Last timestep of the decoded backward chunk = round-trip
                 # estimate of the state at t (see ActionChunk.to_reversed_chunking
-                # / _reverse_absolute_action docstrings for why index -1 is
-                # the right slot).
-                est_val = np.asarray(backward_action[key][-1]).astype(np.float64).reshape(-1)
+                # / _reverse_absolute_action docstrings for why the last slot is
+                # the right one). backward_action[key] may be (H, D) - a bare
+                # chunk, the convention this module's own unit tests' stub
+                # policies use - or (B, H, D) - the real Gr00tPolicy.get_action
+                # contract (see Gr00tPolicy._get_action / check_action), which
+                # always has B=1 here since `future_obs` is a single-window
+                # observation. Collapsing every leading dim before indexing the
+                # last row handles both without guessing which one applies.
+                raw_est = np.asarray(backward_action[key])
+                est_val = raw_est.reshape(-1, raw_est.shape[-1])[-1].astype(np.float64)
                 if est_val.shape != true_val.shape:
                     # Action/state dims can legitimately differ (e.g. a rot6d
                     # action vs. a differently-parameterized state column) -
@@ -223,9 +230,7 @@ def compute_round_trip_consistency(
                 valid_start_steps.append(t)
 
         if not agg_errs:
-            logging.warning(
-                "No valid round-trip windows for traj %d at depth %d.", traj_id, depth
-            )
+            logging.warning("No valid round-trip windows for traj %d at depth %d.", traj_id, depth)
             continue
 
         results[depth] = RoundTripConsistencyResult(

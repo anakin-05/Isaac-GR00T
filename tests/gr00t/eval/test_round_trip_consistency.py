@@ -113,7 +113,10 @@ class TestComputeRoundTripConsistencyShapes:
     def test_shapes_and_finiteness(self, loader):
         action_keys = loader.modality_configs["action"].modality_keys
         traj = loader[TRAJ_ID]
-        dims = {key: np.asarray(traj[f"action.{key}"].iloc[0]).reshape(-1).shape[0] for key in action_keys}
+        dims = {
+            key: np.asarray(traj[f"action.{key}"].iloc[0]).reshape(-1).shape[0]
+            for key in action_keys
+        }
         policy = self._ConstantStubPolicy(action_keys, dims)
 
         results = compute_round_trip_consistency(
@@ -136,6 +139,47 @@ class TestComputeRoundTripConsistencyShapes:
             compute_round_trip_consistency(
                 None, loader, TRAJ_ID, EMBODIMENT_TAG, use_predicted_forward=True
             )
+
+    class _BatchedStubPolicy(_ConstantStubPolicy):
+        """Returns the real Gr00tPolicy.get_action contract - (B, H, D), with
+        B=1 - rather than this module's own (H, D) convention (see
+        _ConstantStubPolicy above). compute_round_trip_consistency must not
+        silently produce zero valid windows against a real policy just
+        because its test stubs happen to use a different, unbatched shape."""
+
+        def get_action(self, observation, options=None):
+            unbatched, info = super().get_action(observation, options)
+            return {key: val[None, ...] for key, val in unbatched.items()}, info
+
+    def test_batched_policy_output_matches_unbatched(self, loader):
+        """A (B=1, H, D) policy output must produce the same C_i as the
+        equivalent (H, D) output - not silently zero valid windows."""
+        action_keys = loader.modality_configs["action"].modality_keys
+        traj = loader[TRAJ_ID]
+        dims = {
+            key: np.asarray(traj[f"action.{key}"].iloc[0]).reshape(-1).shape[0]
+            for key in action_keys
+        }
+
+        unbatched_results = compute_round_trip_consistency(
+            self._ConstantStubPolicy(action_keys, dims),
+            loader,
+            TRAJ_ID,
+            EMBODIMENT_TAG,
+            depths=[1],
+            steps=120,
+        )
+        batched_results = compute_round_trip_consistency(
+            self._BatchedStubPolicy(action_keys, dims),
+            loader,
+            TRAJ_ID,
+            EMBODIMENT_TAG,
+            depths=[1],
+            steps=120,
+        )
+
+        assert 1 in batched_results
+        np.testing.assert_array_equal(batched_results[1].c_i, unbatched_results[1].c_i)
 
 
 class TestComputeRoundTripConsistencyExactRecovery:
