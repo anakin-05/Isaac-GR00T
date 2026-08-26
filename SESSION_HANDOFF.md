@@ -19,32 +19,49 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
 
 ## 1. Where things stand
 
-- **Code integration: done, committed, pushed.**
+- **Code integration: done, committed, pushed** (as of the previous machine — this session's new
+  fixes below are not committed yet, see end of this section).
   - `04fd2e1` — `feat: add round-trip consistency to GR00T N1.7` (22 files, 2334 insertions).
   - `8c2be62` — `docs: update HANDOFF_ROUND_TRIP_CONSISTENCY.md`.
-  - 689 CPU tests passing, 9 skipped (`python -m pytest tests/ -m "not gpu" -v --timeout=300`).
   - Full technical detail (file-by-file changes, what's verified, exact commands) is in
     [`HANDOFF_ROUND_TRIP_CONSISTENCY.md`](./HANDOFF_ROUND_TRIP_CONSISTENCY.md) at repo root —
     read that first, it's the primary technical handoff.
-- **GPU fine-tune + eval (plan's Step 1/2): blocked on hardware, explicitly deferred by the user.**
-  - Root cause: fixed FP32 weight+gradient+Adam-state overhead (~28-32GB) exceeds a single RTX
-    5090's 31.34GiB regardless of batch size / gradient checkpointing (checkpointing turned out to
-    be a no-op in this repo — `DiT.forward` never actually calls
-    `torch.utils.checkpoint.checkpoint`, despite declaring `_supports_gradient_checkpointing =
-    True`). Needs a GPU with more headroom (recommend ≥40GB) — see
-    `HANDOFF_ROUND_TRIP_CONSISTENCY.md` for the exact recommended command and full memory-usage
-    table across configs tried.
-  - **User's instruction**: "no need to smoke test for now, create a handoff when I have a more
-    capable machine I will run smoke test" — i.e., this is intentionally left for the more capable
-    machine, not something to keep debugging.
+- **GPU fine-tune + eval (plan's Step 1/2): done, on a new machine with a 40GB H100 MIG slice
+  (`CUDA_VISIBLE_DEVICES=MIG-...`).** The 2x RTX 5090 (31.34GiB each) blocker below no longer
+  applies — a ≥40GB GPU, as originally recommended, was enough with plenty of room to spare (no
+  need for `--no-tune-projector` or gradient checkpointing). Step 0 (smoke test), Step 1 (real
+  1000-step fine-tune on `demo_data/droid_sample`), and Step 2 (open-loop eval + round-trip
+  diagnostic) all passed, with real C_i numbers now in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s "Done
+  — GPU fine-tune + eval run" section — read that for the full detail, including two **new bugs
+  found and fixed** while doing this (both real, both previously latent, neither caught by the CPU
+  test suite because both only manifest against real data/policies the mocked unit tests didn't
+  exercise):
+  1. `state_action_processor.py`'s `apply_reversed` crashed on `LIBERO_PANDA`'s real dataset (a
+     dimension-mismatched gripper state/action pair DROID doesn't have) — fixed to skip reversal
+     for that one key instead of crashing.
+  2. `round_trip_consistency.py` silently produced zero valid round-trip windows against the real
+     `Gr00tPolicy` (a batch-shape indexing bug — its own unit tests' mocked stubs return `(H, D)`,
+     the real policy returns `(B, H, D)`) — fixed, now produces real, sensible C_i values.
+  - **Not yet committed** — these two fixes + their new tests + this doc's rewritten GPU section
+    are sitting as uncommitted changes on `feat/round-trip-consistency`. Commit them (see §2 for
+    commit-message style) before doing anything else on a new machine.
+  - Separately, also launched a full-scale (non-plan, additional) real fine-tune on LIBERO with RTC
+    enabled at production-scale hyperparameters (40658 steps, batch 32) — see
+    `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s "In progress" section for the command and status; this
+    was still running (multi-hour run) when this file was last updated — check
+    `examples/LIBERO/logs/libero_rtc/checkpoint-*` for the latest checkpoint reached.
 - **Closed-loop evaluation extension (LIBERO / RoboCasa / RoboCasa-GR1-Tabletop / RoboLab):
-  designed, not implemented.** Full design is in §3 below (also in the plan file, copied
-  verbatim). Zero code written for this yet.
-- **Last state before this export**: I had just finished writing the closed-loop-eval design into
-  both the plan file and `HANDOFF_ROUND_TRIP_CONSISTENCY.md`, and asked the user whether to (a)
-  implement the closed-loop mechanisms next, or (b) just commit the doc updates first. The doc
-  updates got committed (`8c2be62`); no answer yet on (a) — **that's the open decision to pick up
-  on the new machine.**
+  still designed, not implemented.** Full design is in §3 below (also in the plan file, copied
+  verbatim). Zero code written for this yet — unaffected by this session's work, which was all
+  about actually running the already-implemented offline/open-loop path, plus fixing the two bugs
+  that surfaced from doing so.
+- **Last state before this update**: both fixes verified (CPU suite: 738 passed, 9 skipped, same 2
+  pre-existing unrelated environmental failures as always — a stray nested venv under
+  `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a missing
+  `HF_TOKEN` env var for one edge-device test — neither is a regression from this session), Step
+  0/1/2 all passed with real numbers recorded, LIBERO production-scale run in progress. **Open
+  decision for the next session, per below, is unchanged** — the closed-loop eval extension is
+  still the next undone piece of the original plan.
 
 ## 2. Working agreements from this session (apply these on the new machine too)
 
@@ -245,6 +262,10 @@ from).
 
 ## 5. Open decision for the next session
 
-Pick up by asking (or deciding): implement the closed-loop evaluation mechanisms now (§3 above),
-or run the deferred GPU fine-tune/eval (`HANDOFF_ROUND_TRIP_CONSISTENCY.md` §"Blocked") first now
-that a more capable machine is available. Both are independent and can happen in either order.
+The GPU fine-tune/eval deferral is resolved (§1 above) — both Steps 0-2 passed on a 40GB MIG
+slice, with two real bugs found and fixed along the way. First, commit that work (§1's "not yet
+committed" note) if it hasn't been already. After that, the only remaining undone piece of the
+original plan is implementing the closed-loop evaluation mechanisms (§3 above) — pick up there,
+after checking whether the in-progress LIBERO production-scale fine-tune (§1) has finished, since
+its checkpoint would be a natural first thing to point a closed-loop eval at once that mechanism
+exists.
