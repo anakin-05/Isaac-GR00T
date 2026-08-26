@@ -87,6 +87,26 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    # Round-trip consistency monitor configs (see gr00t/policy/round_trip_monitor.py)
+    enable_round_trip_monitor: bool = False
+    """If True, wrap the policy in RoundTripMonitor - a server-side round-trip-consistency
+    diagnostic that periodically queries the model's backward direction and logs C_i to a
+    JSONL sidecar. Reaches any closed-loop client transparently (no client-side changes
+    needed). Only meaningful for a checkpoint trained with --enable-direction-conditioning."""
+
+    round_trip_check_interval: int = 8
+    """Run the diagnostic every this many get_action calls (matches the --n-action-steps /
+    --open-loop-horizon convention used by LIBERO/RoboCasa/RoboCasa-GR1/RoboLab examples).
+    Only used when --enable-round-trip-monitor is set."""
+
+    round_trip_depths: tuple[int, ...] = (1, 2, 4)
+    """Rollout depths (in units of get_action calls) to evaluate. Only used when
+    --enable-round-trip-monitor is set."""
+
+    round_trip_log_path: str | None = None
+    """JSONL sidecar log path. Defaults to /tmp/round_trip_consistency/<timestamp>.jsonl.
+    Only used when --enable-round-trip-monitor is set."""
+
 
 def main(config: ServerConfig):
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
@@ -163,6 +183,22 @@ def main(config: ServerConfig):
         from gr00t.policy.gr00t_policy import Gr00tSimPolicyWrapper
 
         policy = Gr00tSimPolicyWrapper(policy)
+
+    # RoundTripMonitor wraps whatever is outermost so far, transparent to every
+    # closed-loop client's wire protocol (see gr00t/policy/round_trip_monitor.py).
+    if config.enable_round_trip_monitor:
+        from gr00t.policy.round_trip_monitor import RoundTripMonitor
+
+        policy = RoundTripMonitor(
+            policy,
+            round_trip_check_interval=config.round_trip_check_interval,
+            round_trip_depths=list(config.round_trip_depths),
+            round_trip_log_path=config.round_trip_log_path,
+        )
+        print(
+            f"  Round-trip monitor: enabled (interval={config.round_trip_check_interval}, "
+            f"depths={list(config.round_trip_depths)}, log={policy.round_trip_log_path})"
+        )
 
     with PolicyServer(
         policy=policy,

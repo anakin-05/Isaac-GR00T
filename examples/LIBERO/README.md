@@ -143,6 +143,31 @@ gr00t/eval/sim/LIBERO/libero_uv/.venv/bin/python gr00t/eval/rollout_policy.py \
     --n-envs 5
 ```
 
+## Round-trip consistency monitoring
+
+For a checkpoint fine-tuned with `--enable-direction-conditioning` (see the
+[round-trip-consistency integration handoff](../../HANDOFF_ROUND_TRIP_CONSISTENCY.md)), add
+these flags to the server command above to also log a round-trip-consistency diagnostic
+($\mathcal{C}_i$) alongside the rollout, with **no changes to the client command**:
+
+```bash
+uv run python gr00t/eval/run_gr00t_server.py \
+    --model-path <checkpoint-dir> \
+    --embodiment-tag LIBERO_PANDA \
+    --use-sim-policy-wrapper \
+    --enable-round-trip-monitor \
+    --round-trip-check-interval 8 \
+    --round-trip-depths 1 2 4 \
+    --round-trip-log-path /tmp/round_trip_consistency/libero_goal.jsonl
+```
+
+Keep `--round-trip-check-interval` equal to the client's `--n-action-steps` above (both
+default to 8) — the server has no way to see the client's execution horizon, so a mismatch
+here means depth `i` no longer corresponds to `i` actual chunk executions. This adds one
+extra backward-direction inference call per env slot every `round_trip_check_interval`
+calls (a real compute cost, not free), and does nothing for a checkpoint that wasn't trained
+with direction conditioning — don't enable it for a baseline (non-RTC) checkpoint.
+
 # Full task list
 
 ## Libero 10 (Long)

@@ -15,10 +15,12 @@
 
 from .gr00t_policy import Gr00tPolicy
 from .policy import BasePolicy, PolicyWrapper
+from .round_trip_monitor import RoundTripMonitor
 
 
 __all__ = [
     "BasePolicy",
     "Gr00tPolicy",
     "PolicyWrapper",
+    "RoundTripMonitor",
 ]
