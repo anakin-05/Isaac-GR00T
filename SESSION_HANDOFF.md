@@ -42,26 +42,31 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
   2. `round_trip_consistency.py` silently produced zero valid round-trip windows against the real
      `Gr00tPolicy` (a batch-shape indexing bug — its own unit tests' mocked stubs return `(H, D)`,
      the real policy returns `(B, H, D)`) — fixed, now produces real, sensible C_i values.
-  - **Not yet committed** — these two fixes + their new tests + this doc's rewritten GPU section
-    are sitting as uncommitted changes on `feat/round-trip-consistency`. Commit them (see §2 for
-    commit-message style) before doing anything else on a new machine.
-  - Separately, also launched a full-scale (non-plan, additional) real fine-tune on LIBERO with RTC
-    enabled at production-scale hyperparameters (40658 steps, batch 32) — see
-    `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s "In progress" section for the command and status; this
-    was still running (multi-hour run) when this file was last updated — check
-    `examples/LIBERO/logs/libero_rtc/checkpoint-*` for the latest checkpoint reached.
+  - Committed on `feat/round-trip-consistency` (see §2 for commit-message style): one commit for
+    the two fixes + their tests, one for the doc updates.
+  - Separately, also ran a full-scale (non-plan, additional) real fine-tune on LIBERO with RTC
+    enabled at production-scale hyperparameters (40658 steps, batch 32) — **completed all 40658
+    steps**, final checkpoint `examples/LIBERO/logs/libero_rtc/checkpoint-40658`, eval'd
+    (open-loop MSE/MAE + round-trip C_i on 3 trajectories, real numbers in
+    `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s "Done: real LIBERO+RTC fine-tune" section). Took 5
+    crash/resume cycles from two distinct causes (both diagnosed and documented there): a
+    corrupt-checkpoint-on-resume gotcha (fixed by deleting the partial checkpoint before
+    resuming), and this environment's shared SLURM cgroup memory limit (256 GiB, shared with other
+    concurrent jobs not part of this work) intermittently OOM-killing a process — mitigated (not
+    fully eliminated) by cutting `--dataloader-num-workers` 4→2. Worth knowing before launching
+    another long unattended run on a similarly shared machine.
 - **Closed-loop evaluation extension (LIBERO / RoboCasa / RoboCasa-GR1-Tabletop / RoboLab):
   still designed, not implemented.** Full design is in §3 below (also in the plan file, copied
   verbatim). Zero code written for this yet — unaffected by this session's work, which was all
-  about actually running the already-implemented offline/open-loop path, plus fixing the two bugs
-  that surfaced from doing so.
+  about actually running the already-implemented offline/open-loop path, fixing the two bugs
+  that surfaced from doing so, and running the LIBERO fine-tune to completion.
 - **Last state before this update**: both fixes verified (CPU suite: 738 passed, 9 skipped, same 2
   pre-existing unrelated environmental failures as always — a stray nested venv under
   `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a missing
   `HF_TOKEN` env var for one edge-device test — neither is a regression from this session), Step
-  0/1/2 all passed with real numbers recorded, LIBERO production-scale run in progress. **Open
-  decision for the next session, per below, is unchanged** — the closed-loop eval extension is
-  still the next undone piece of the original plan.
+  0/1/2 (droid_sample) and the LIBERO production-scale run both complete with real numbers
+  recorded. **Open decision for the next session, per below, is unchanged** — the closed-loop eval
+  extension is still the next undone piece of the original plan.
 
 ## 2. Working agreements from this session (apply these on the new machine too)
 
@@ -262,10 +267,10 @@ from).
 
 ## 5. Open decision for the next session
 
-The GPU fine-tune/eval deferral is resolved (§1 above) — both Steps 0-2 passed on a 40GB MIG
-slice, with two real bugs found and fixed along the way. First, commit that work (§1's "not yet
-committed" note) if it hasn't been already. After that, the only remaining undone piece of the
-original plan is implementing the closed-loop evaluation mechanisms (§3 above) — pick up there,
-after checking whether the in-progress LIBERO production-scale fine-tune (§1) has finished, since
-its checkpoint would be a natural first thing to point a closed-loop eval at once that mechanism
-exists.
+The GPU fine-tune/eval deferral is resolved (§1 above) — Steps 0-2 (droid_sample) and the LIBERO
+production-scale fine-tune both completed, with two real bugs found and fixed along the way, all
+committed. The only remaining undone piece of the original plan is implementing the closed-loop
+evaluation mechanisms (§3 above) — pick up there. The completed LIBERO checkpoint
+(`examples/LIBERO/logs/libero_rtc/checkpoint-40658`) is a natural first thing to point a
+closed-loop eval at once that mechanism exists, since LIBERO is one of the three benchmarks
+(LIBERO/RoboCasa/RoboCasa-GR1) Mechanism 2 targets directly.

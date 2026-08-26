@@ -151,10 +151,10 @@ CPU suite re-run after both fixes: `738 passed, 9 skipped, 35 deselected` (up fr
 the 3 new regression tests above), same 2 pre-existing environmental failures as before
 (unrelated to this integration — see Known Issues below), no regressions.
 
-### In progress: real LIBERO+RTC fine-tune (separate from the droid_sample validation above)
+### Done: real LIBERO+RTC fine-tune, full 40658 steps (separate from the droid_sample validation above)
 
-Beyond the plan's own droid_sample-based Steps 0-2, also launched a full-scale fine-tune
-on `examples/LIBERO/libero_goal_no_noops_1.0.0_lerobot` with RTC enabled, matching the
+Beyond the plan's own droid_sample-based Steps 0-2, also ran a full-scale fine-tune on
+`examples/LIBERO/libero_goal_no_noops_1.0.0_lerobot` with RTC enabled, matching the
 hyperparameters of this repo's own pre-existing (non-RTC) LIBERO baseline recipe
 (`examples/LIBERO/logs/libero-base_line/libero_goal`: `max_steps=40658`,
 `global_batch_size=32`, `warmup_ratio=0.05`, `learning_rate=1e-4`, `weight_decay=1e-5`):
@@ -168,26 +168,78 @@ CUDA_VISIBLE_DEVICES=<mig-or-gpu-uuid> uv run python gr00t/experiment/launch_fin
     --output-dir examples/LIBERO/logs/libero_rtc \
     --max-steps 40658 --save-steps 1000 --save-total-limit 5 \
     --warmup-ratio 0.05 --weight-decay 1e-5 --learning-rate 1e-4 \
-    --global-batch-size 32 --dataloader-num-workers 4 \
+    --global-batch-size 32 --dataloader-num-workers 2 \
     --shard-size 1024 --num-shards-per-epoch 100000 --episode-sampling-rate 0.1 \
     --enable-direction-conditioning --p-backward 0.5 \
-    --vision-dropout-prob-backward 1.0 --backward-loss-weight 1.0
+    --vision-dropout-prob-backward 1.0 --backward-loss-weight 1.0 \
+    --resume-from-checkpoint   # add once an output-dir already has checkpoints
 ```
 
 A first attempt at this (before the `apply_reversed` fix above existed) got as far as
 saving its config/processor but crashed on the very first training batch with the
 dimension-mismatch bug — the batch size (32) was not the cause, despite looking like an
 OOM candidate at first glance. After the fix, a 20-step smoke test at batch 8 passed
-cleanly, then the real 40658-step run at batch 32 was (re)launched into the same
-`examples/LIBERO/logs/libero_rtc` output dir and confirmed past checkpoint-1000 with no
-OOM and finite forward/backward losses (~0.2 range, still in the 5%-warmup phase) — **batch
-32 is confirmed safe on a 40GB MIG slice for this model+resolution combination**. ETA from
-the observed rate (~2.5 it/s at batch 32) is roughly 5.5 hours for the full run; check
-`examples/LIBERO/logs/libero_rtc/checkpoint-*` for the latest progress if picking this up
-later. This run's purpose is closer to "does the RTC feature survive a real production-scale
-LIBERO fine-tune" than the plan's own 3-episode droid_sample plumbing check — a useful
-independent validation, but its results (once complete) should be read as auxiliary to,
-not a replacement for, the droid_sample Steps 0-2 above.
+cleanly, then the real run was launched at batch 32 and **completed all 40658 steps** into
+`examples/LIBERO/logs/libero_rtc/checkpoint-40658` — `train_loss` and per-step
+forward/backward losses finite throughout, settling in the ~0.06-0.09 range by the end,
+learning rate fully annealed per the cosine schedule.
+
+**It took 5 crash/resume cycles to get there, from two distinct causes** — worth knowing if
+running further LIBERO/RTC fine-tunes on a similarly shared machine:
+
+1. **Corrupt checkpoint on resume (2 occurrences).** `--resume-from-checkpoint` always picks
+   the highest-numbered `checkpoint-*` in `output_dir`, but a kill mid-save leaves a partial
+   directory (missing `trainer_state.json`, sometimes missing model shards/`optimizer.pt`
+   too) that still *looks* like a valid checkpoint by name. Resuming into it fails with
+   `FileNotFoundError: .../trainer_state.json`. Fix each time: delete the corrupt
+   `checkpoint-N` directory (check `ls -la` for a suspiciously small/incomplete file list
+   before trusting a checkpoint after any crash) so resume falls back to the next-latest
+   complete one.
+2. **Shared SLURM cgroup memory pressure (3 occurrences), diagnosed via `/proc/self/cgroup`.**
+   This environment runs inside a SLURM job under Kubernetes
+   (`kubepods.../slurmstepd.scope/job_7488/...`) with a **256 GiB memory cgroup limit**
+   (`/sys/fs/cgroup/.../job_7488/memory.max`) *shared* across every process in that
+   allocation — `free -h`'s host-wide 2 TiB total is not the real constraint and looked
+   fine throughout, which is why this took a while to diagnose. `memory.current` for
+   `job_7488` was observed at 94-99.9996% of the 256 GiB limit while multiple concurrent
+   LIBERO fine-tunes (this one plus 3 others not part of this work, apparently launched
+   independently by someone else sharing this allocation) were all running. The kernel's
+   cgroup-OOM-killer intermittently picked a victim process when the shared total tipped
+   over — sometimes this job's main process (silent `SIGKILL`, exit 137, no Python
+   traceback), once a caught `RuntimeError: DataLoader worker ... is killed by signal:
+   Killed` (exit 1, with a full traceback — this is what actually surfaced the diagnosis).
+   Mitigation: cut `--dataloader-num-workers` from 4 to 2 (fewer worker processes each
+   independently caching dataset shards in memory) — did not eliminate the pressure (one
+   more kill happened after this change) but the run finished without further incident
+   afterward. If this recurs on a similarly shared machine, check
+   `/proc/self/cgroup` for a SLURM job path, then
+   `cat /sys/fs/cgroup/<that-path>/memory.current` vs `memory.max` — don't trust `free -h`
+   alone.
+
+**Eval against the final checkpoint** (`open_loop_eval.py`, same invocation shape as the
+droid_sample Step 2, `--execution-horizon 8` matching LIBERO's `action_horizon=16`/2,
+3 trajectories from `libero_goal_no_noops_1.0.0_lerobot`):
+
+| Traj | Open-loop MSE | Open-loop MAE | C_1 (mean±std, n) | C_2 (mean±std, n) | C_4 (mean±std, n) |
+|---|---|---|---|---|---|
+| 0 | 0.0224 | 0.0703 | 1.387 ± 0.054 (6) | 1.396 ± 0.054 (5) | 1.426 ± 0.023 (3) |
+| 1 | 0.0150 | 0.0540 | 0.860 ± 0.290 (9) | 0.848 ± 0.305 (8) | 0.906 ± 0.323 (6) |
+| 2 | 0.0227 | 0.0709 | 0.987 ± 0.242 (9) | 0.971 ± 0.252 (8) | 1.027 ± 0.256 (6) |
+
+Plots: `/tmp/open_loop_eval/libero_traj_rtc_traj{0,1,2}_rtc.png`. Two things to note reading
+these against the droid_sample table above: (1) **C_i's absolute scale is not comparable
+across datasets** — it's an unnormalized state-space MSE, and LIBERO's `x/y/z/roll/pitch/
+yaw/gripper` state representation has a different physical scale than DROID's `eef_9d`/
+`gripper_position`/`joint_position`, so LIBERO's C_i sitting an order of magnitude higher
+than DROID's is not evidence of a worse model — only within-dataset, cross-depth/cross-
+trajectory comparisons are meaningful. (2) Unlike DROID's clean monotonic-with-depth
+pattern, LIBERO's C_i is close to flat across depths 1/2/4 for all three trajectories (e.g.
+traj 0: 1.387→1.396→1.426) — plausibly because LIBERO's much larger, more diverse training
+set (428 episodes vs. DROID's 3) already fits the backward direction well enough at this
+depth range that additional rollout depth doesn't compound error as visibly, but this is
+speculative; per the plan's Caveat 5, don't over-read either dataset's pattern as a
+validated finding without more trajectories and a proper calibration pass
+(`gr00t/eval/calibration.py`).
 
 ### Historical: the original 2x RTX 5090 blocker (superseded above, kept for reference)
 
