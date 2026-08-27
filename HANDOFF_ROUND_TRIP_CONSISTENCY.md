@@ -333,18 +333,33 @@ real-cost-aware optimization beyond what the plan specified. Wired into
 happens *after* `--use-sim-policy-wrapper` so it sits outermost, transparent to whatever
 client is talking to the server (verified: `options` already forwards end-to-end through
 `PolicyServer` → `Gr00tPolicy`/`Gr00tSimPolicyWrapper`, no server/RPC changes needed). New
-tests: `tests/gr00t/policy/test_round_trip_monitor.py` (6 tests, mocked `BasePolicy`,
+tests: `tests/gr00t/policy/test_round_trip_monitor.py` (10 tests, mocked `BasePolicy`,
 CPU-safe — interval/depth bookkeeping, multi-env-slot independence, exact-recovery at
-depth 1, reset-clears-history, and failure isolation: a round-trip check that raises
-never breaks real closed-loop control). New README subsection:
-`examples/LIBERO/README.md`'s "Round-trip consistency monitoring".
+depth 1, reset-clears-history, failure isolation (a round-trip check that raises never
+breaks real closed-loop control), and per-episode/per-task identity — see below). New
+README subsection: `examples/LIBERO/README.md`'s "Round-trip consistency monitoring".
 
-**Mechanism 2** (client-side hook in `gr00t/eval/rollout_policy.py`, richer per-episode
-$\mathcal{C}_i$ for LIBERO/RoboCasa/RoboCasa-GR1 specifically) — **not implemented.**
-Mechanism 1 alone was sufficient for the benchmark below and reaches RoboLab too, which
-Mechanism 2 structurally cannot; revisit if per-episode/per-task $\mathcal{C}_i$
-correlation becomes the priority (see Caveat below on why this benchmark didn't exercise
-that correlation).
+**Later addition (after the LIBERO 10 benchmark below surfaced the need): per-episode and
+per-task identity.** `RoundTripMonitor` now accepts optional `options["round_trip_episode_ids"]`
+(per-slot id, changed by the caller when that slot's episode ends — catches gymnasium's
+inline autoreset starting a new episode in the same slot mid-rollout, which positional
+slot index alone can't see) and `options["round_trip_task"]` (a constant label logged into
+every row). `rollout_policy.py` supplies both automatically now; both are optional and
+stripped before reaching the wrapped policy, so any caller that doesn't set them (RoboLab)
+is unaffected. New tests in `tests/gr00t/eval/test_rollout_round_trip_options.py` and
+`TestEpisodeIdAndTask` in the monitor's own test file; **verified live** (not just
+unit-tested) — see the LIBERO 10 section below for the corrected root-cause writeup and
+real evidence this actually works.
+
+**Mechanism 2** (client-side hook in `gr00t/eval/rollout_policy.py`, ties
+$\mathcal{C}_i$ to `episode_infos` natively for LIBERO/RoboCasa/RoboCasa-GR1
+specifically) — **still not implemented.** Mechanism 1 (now with the episode-id/task
+addition above) can already answer the per-task/per-episode correlation question that
+motivated Mechanism 2 in the first place, for the clients we control; Mechanism 2 remains
+worth building only if querying `episode_infos["task_progress"]`/`"q_score"` directly
+(rather than cross-referencing a separate JSONL log by task/episode-id) becomes valuable,
+or Mechanism 1's compute cost (one extra inference call per slot per interval, everywhere)
+needs to be avoided for benchmarks Mechanism 2 doesn't need to run.
 
 ### LIBERO Goal closed-loop benchmark: RTC vs. baseline (real sim, real rollouts)
 
@@ -446,18 +461,33 @@ pattern across depths as Goal (means 1.603 / 1.603 / 1.604 for depths 1/2/4) and
 `roll`-dominates-per-key pattern (mean MSE 7.67, next highest `pitch` at 1.81, everything
 else <0.1). **Attempted to correlate per-task $\mathcal{C}_i$ against the two weak RTC
 tasks (KITCHEN_SCENE8 at 7/10, KITCHEN_SCENE6 at 7/10) and could not** — the JSONL schema
-has no task/episode field, and the only available proxy (segmenting rows by detecting
-`call_index` resets per `env_slot`, on the theory that a new `rollout_policy.py` client
-connecting triggers exactly one `RoundTripMonitor.reset()` per task) produced far more
-segments (46) than tasks (10), because **individual env slots' `call_index` also appears to
-reset mid-task**, most likely because `RoundTripMonitor` identifies an env purely by its
-*positional* index in the batched observation (`range(batch_size)`), and the vectorized
-collector's batch can shrink as individual sub-envs finish their share of the episode quota
-before others — reassigning what looks like "slot 2" to a different underlying environment
-mid-rollout. **This is a real, previously-undocumented limitation of Mechanism 1's current
-identity tracking**, not a data-quality issue with this run: a future improvement would tag
-each JSONL row with a stable per-episode/task identifier (passed through `options`, if the
-client is willing to supply one) rather than relying on positional batch index across calls.
+had no task/episode field, and the only available proxy (segmenting rows by detecting
+`call_index` resets per `env_slot`) produced far more segments (46) than tasks (10).
+
+**Root cause, corrected after further investigation (the first write-up here was wrong):**
+reading `_collect_rollout_episodes` directly shows `env_idx` is positionally *stable* for
+an entire `rollout_policy.py` invocation - the vectorized batch never shrinks or reassigns
+slots, ruling out the "batch reassignment" theory originally suspected here. The real
+cause is gymnasium 0.29.1's **inline autoreset**: each env slot runs *multiple episodes
+back-to-back* within one task's rollout (10 episodes over 5 envs means ~2 episodes/slot on
+average), and `RoundTripMonitor` had no way to know a new episode had silently started in
+the same slot - so its `call_index` bookkeeping (correctly) never reset mid-task, but the
+history it accumulated could span real episode boundaries invisibly.
+
+**Fixed** (`gr00t/policy/round_trip_monitor.py`, `gr00t/eval/rollout_policy.py`): added
+two optional, additive `options` keys - `round_trip_episode_ids` (per-slot id that changes
+exactly when that slot's episode ends) and `round_trip_task` (a constant label for the
+whole rollout). `rollout_policy.py` now supplies both automatically; a slot whose id
+changes gets its history cleared immediately (no explicit `reset()` needed), and both
+fields are logged into every JSONL row. Absent for a caller that never sets them (RoboLab,
+or any pre-existing usage) - identical behavior to before. **Verified live**, not just in
+unit tests: a 6-episode/3-env rollout against `libero_goal-rtc` showed every env slot
+logging exactly two distinct `episode_id`s (`"0:0"`/`"0:1"`, `"1:0"`/`"1:1"`,
+`"2:0"`/`"2:1"`), confirming the fix catches a real mid-rollout autoreset boundary, with
+`task` consistently `"libero_sim/put_the_bowl_on_the_plate"` across all 18 rows. This
+unblocks exactly the per-task correlation this section originally couldn't do - a future
+benchmark run can now group its JSONL log by `task`/`episode_id` directly instead of
+guessing from `call_index` resets.
 
 ### Caveats (closed-loop-specific, found running this for real)
 
@@ -491,12 +521,16 @@ client is willing to supply one) rather than relying on positional batch index a
    slow-but-still-progressing process (check `ps -o pid,etimes,time,%cpu` — CPU time
    should keep advancing) is hung.
 4. **Per-slot `reset()` granularity, flagged as unconfirmed in the plan, is now
-   confirmed**: `gr00t/eval/rollout_policy.py` calls `policy.reset()` exactly once, with no
-   arguments, before the rollout loop begins — it never detects or forwards individual
-   sub-env auto-resets within the vectorized batch. `RoundTripMonitor` clears its entire
-   ring buffer on any `reset()` call, per the plan's documented fallback; a round-trip
-   window spanning an undetected mid-rollout episode boundary is a real but rare
-   (window-length-vs-episode-length) source of noise in the JSONL log, not a crash.
+   confirmed — and since fixed, not just documented**: `gr00t/eval/rollout_policy.py`
+   calls `policy.reset()` exactly once, with no arguments, before the rollout loop begins;
+   it never detects or forwards individual sub-env auto-resets within the vectorized
+   batch. Rather than leave this as a documented blind spot, `RoundTripMonitor` and
+   `rollout_policy.py` now cooperate via optional `options["round_trip_episode_ids"]` to
+   detect exactly this case without needing an actual `reset()` call — see "Later addition:
+   per-episode and per-task identity" above and the LIBERO 10 section below for the fix and
+   its live verification. `RoundTripMonitor` still clears its entire ring buffer on any
+   *explicit* `reset()` call regardless, per the plan's original documented fallback, for
+   any caller that doesn't supply episode ids.
 
 ## Caveats (unchanged from the original plan — still apply)
 

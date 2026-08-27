@@ -78,13 +78,19 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
     one actually produced failures: **RTC 92/101 (91.1%) vs. baseline 94/102 (92.2%)
     overall**, each ahead on some tasks and behind on others, no consistent direction (full
     per-task table in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`). **Tried to correlate per-task
-    C_i against RTC's two weak tasks and could not** — found a real, previously-undocumented
-    limitation: `RoundTripMonitor` identifies an env purely by positional batch index, which
-    the vectorized collector can silently reassign mid-rollout as sub-envs finish their
-    episode quota at different times, so `call_index` resets don't reliably mark task
-    boundaries. A future improvement would tag rows with a stable per-episode identifier
-    passed through `options`.
-- **Last state before this update**: both earlier fixes verified (CPU suite: 744 passed, 9
+    C_i against RTC's two weak tasks and initially could not**, for a reason first
+    misdiagnosed as "positional batch index gets reassigned mid-rollout" — on closer
+    reading of `_collect_rollout_episodes`, that theory was wrong (env slots are positionally
+    stable for a whole task's rollout). The real cause: gymnasium's inline autoreset runs
+    *multiple episodes per slot* within one task, invisibly to `RoundTripMonitor`.
+  - **Fixed, same session**: `RoundTripMonitor` and `rollout_policy.py` now cooperate via
+    optional `options["round_trip_episode_ids"]`/`options["round_trip_task"]` so a slot's
+    history is cleared exactly when its episode changes, and every JSONL row is tagged with
+    both fields. Fully backward compatible (absent for RoboLab or any pre-existing caller).
+    **Verified live**: a 6-episode/3-env rollout showed every slot logging exactly two
+    distinct episode ids, confirming the fix catches a real autoreset boundary. See
+    `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s corrected writeup for the full story.
+- **Last state before this update**: all fixes verified (CPU suite: 750 passed, 9
   skipped, same 2 pre-existing unrelated environmental failures as always — a stray nested venv
   under `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a
   missing `HF_TOKEN` env var for one edge-device test — neither is a regression from this
@@ -300,17 +306,21 @@ production-scale fine-tune, and both LIBERO closed-loop benchmarks (Goal, then t
 came back a clean sweep (100/100 episodes, both RTC and baseline); 10/Long produced genuine
 failures and a close, no-consistent-direction result (RTC 91.1% vs. baseline 92.2% overall) —
 between them, this answers "does RTC training hurt forward-task performance" (no, on both
-suites tested). **What's still unanswered**: whether C_i actually predicts failure, since the
-10/Long run's attempt to correlate per-task C_i against RTC's two weak tasks hit a real
-limitation instead — Mechanism 1 tracks envs by positional batch index, which the vectorized
-collector can silently reassign mid-rollout, so JSONL rows can't currently be attributed to a
-specific task/episode. Two ways forward, either order:
+suites tested).
 
-1. **Give Mechanism 1's JSONL rows a stable per-episode identifier** (passed through
-   `options`, if the client supplies one, or derived some other way that survives batch
-   reshuffling) so C_i can actually be correlated against per-task/per-episode outcomes on
-   data already collected in future runs — this is the more surgical fix and unblocks the
-   actual validation question directly.
+**The per-episode-identity gap that blocked correlating C_i against failure is now fixed**
+(`RoundTripMonitor`/`rollout_policy.py`, `options["round_trip_episode_ids"]`/
+`["round_trip_task"]`, verified live — see §1 above). **What's still unanswered**: whether
+C_i actually predicts failure — the fix unblocks asking this, but nobody has yet re-run a
+benchmark with a genuine success/failure mix (like 10/Long) and actually grouped its JSONL
+log by the new `task`/`episode_id` fields to check the correlation. That's the natural next
+step, either on its own or alongside:
+
+1. **Re-run (or reuse, if the log is still around) the LIBERO 10 benchmark and group
+   `libero_10_rtc_benchmark.jsonl` by `episode_id`/`task`** to see whether C_i is higher on
+   the episodes that actually failed (KITCHEN_SCENE8, KITCHEN_SCENE6 for RTC) — this is the
+   validation the round-trip-consistency mechanism exists for, now actually answerable.
 2. **Implement Mechanism 2** (§3 above, client-side hook in `rollout_policy.py`) — ties C_i
-   to per-episode/per-task success natively via `episode_infos`, sidestepping the identity
-   problem entirely for LIBERO/RoboCasa/RoboCasa-GR1 (not RoboLab, which needs Mechanism 1).
+   to per-episode/per-task success natively via `episode_infos` in one pass, rather than
+   cross-referencing two separate data sources by id; still the only path to RoboCasa-only
+   niceties Mechanism 1 doesn't need but RoboLab structurally can't use either way.
