@@ -71,17 +71,29 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
   are in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s closed-loop section. **Mechanism 2
   (client-side hook in `rollout_policy.py`) is still not implemented** — Mechanism 1 alone
   was sufficient for this benchmark and reaches RoboLab too, which Mechanism 2 structurally
-  cannot; full design for it is still in §3 below if the per-episode/per-task C_i
-  correlation becomes the priority later.
+  cannot.
+  - **Follow-up: also ran the harder LIBERO 10 (Long) suite** (`libero-rtc/libero_10-rtc`
+    vs. `Isaac-GR00T-base_line/.../libero_10`, videos/log this time under
+    `examples/LIBERO/logs/sim_eval_videos/libero_10/` per user request, not `/tmp`) — this
+    one actually produced failures: **RTC 92/101 (91.1%) vs. baseline 94/102 (92.2%)
+    overall**, each ahead on some tasks and behind on others, no consistent direction (full
+    per-task table in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`). **Tried to correlate per-task
+    C_i against RTC's two weak tasks and could not** — found a real, previously-undocumented
+    limitation: `RoundTripMonitor` identifies an env purely by positional batch index, which
+    the vectorized collector can silently reassign mid-rollout as sub-envs finish their
+    episode quota at different times, so `call_index` resets don't reliably mark task
+    boundaries. A future improvement would tag rows with a stable per-episode identifier
+    passed through `options`.
 - **Last state before this update**: both earlier fixes verified (CPU suite: 744 passed, 9
   skipped, same 2 pre-existing unrelated environmental failures as always — a stray nested venv
   under `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a
   missing `HF_TOKEN` env var for one edge-device test — neither is a regression from this
-  session), Step 0/1/2 (droid_sample), the LIBERO production-scale fine-tune, and the LIBERO
-  closed-loop benchmark are all complete with real numbers recorded. **Open decision for the
-  next session**: implement Mechanism 2 if per-episode C_i correlation is wanted, or run a
-  harder/noisier benchmark (to get a genuine success/failure mix) against the existing
-  Mechanism 1 to actually test whether C_i predicts failure — see §5 below.
+  session), Step 0/1/2 (droid_sample), the LIBERO production-scale fine-tune, and both LIBERO
+  closed-loop benchmarks (Goal and 10/Long) are all complete with real numbers recorded.
+  **Open decision for the next session**: implement Mechanism 2 if per-episode C_i
+  correlation is wanted (now more clearly motivated, since Mechanism 1's positional-index
+  limitation makes per-task C_i attribution unreliable as-is), or add a stable per-episode ID
+  to Mechanism 1's JSONL rows directly — see §5 below.
 
 ## 2. Working agreements from this session (apply these on the new machine too)
 
@@ -283,17 +295,22 @@ from).
 ## 5. Open decision for the next session
 
 The GPU fine-tune/eval deferral is resolved (§1 above) — Steps 0-2 (droid_sample), the LIBERO
-production-scale fine-tune, and the LIBERO closed-loop benchmark (Mechanism 1) are all complete,
-with real bugs found and fixed along the way, all committed. The LIBERO Goal benchmark came back
-a clean sweep (100/100 episodes, both RTC and baseline) — a good "doesn't hurt task performance"
-result, but not a test of whether C_i actually predicts failure, since nothing failed. Two
-independent next steps, either order:
+production-scale fine-tune, and both LIBERO closed-loop benchmarks (Goal, then the harder
+10/Long) are all complete, with real bugs found and fixed along the way, all committed. Goal
+came back a clean sweep (100/100 episodes, both RTC and baseline); 10/Long produced genuine
+failures and a close, no-consistent-direction result (RTC 91.1% vs. baseline 92.2% overall) —
+between them, this answers "does RTC training hurt forward-task performance" (no, on both
+suites tested). **What's still unanswered**: whether C_i actually predicts failure, since the
+10/Long run's attempt to correlate per-task C_i against RTC's two weak tasks hit a real
+limitation instead — Mechanism 1 tracks envs by positional batch index, which the vectorized
+collector can silently reassign mid-rollout, so JSONL rows can't currently be attributed to a
+specific task/episode. Two ways forward, either order:
 
-1. **Implement Mechanism 2** (§3 above, client-side hook in `rollout_policy.py`) — richer,
-   ties C_i to per-episode/per-task success directly for LIBERO/RoboCasa/RoboCasa-GR1 (not
-   RoboLab, which needs Mechanism 1).
-2. **Run a benchmark that can actually produce failures** — a harder LIBERO suite (10/Long
-   rather than Goal), an earlier/undertrained checkpoint, or an out-of-distribution scene —
-   against the *already-implemented* Mechanism 1, to see whether C_i is higher on the
-   episodes that fail. This is the actual validation the round-trip-consistency mechanism
-   exists for, and nothing in this session's LIBERO Goal sweep could show it either way.
+1. **Give Mechanism 1's JSONL rows a stable per-episode identifier** (passed through
+   `options`, if the client supplies one, or derived some other way that survives batch
+   reshuffling) so C_i can actually be correlated against per-task/per-episode outcomes on
+   data already collected in future runs — this is the more surgical fix and unblocks the
+   actual validation question directly.
+2. **Implement Mechanism 2** (§3 above, client-side hook in `rollout_policy.py`) — ties C_i
+   to per-episode/per-task success natively via `episode_infos`, sidestepping the identity
+   problem entirely for LIBERO/RoboCasa/RoboCasa-GR1 (not RoboLab, which needs Mechanism 1).

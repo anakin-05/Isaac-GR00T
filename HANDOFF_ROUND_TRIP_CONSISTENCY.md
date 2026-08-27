@@ -404,6 +404,61 @@ particular benchmark cannot speak to whether $\mathcal{C}_i$ predicts failure, s
 failed. A benchmark with a genuine success/failure mix (a harder task suite, fewer training
 steps, or an out-of-distribution scene) is needed for that question.
 
+### LIBERO 10 (Long) closed-loop benchmark: RTC vs. baseline (the harder suite, real failures)
+
+Ran the same comparison against **LIBERO 10 (Long)** — the long-horizon, multi-step suite,
+harder than Goal — using `examples/LIBERO/logs/libero-rtc/libero_10-rtc` (checkpoint-79273)
+vs. `Isaac-GR00T-base_line/examples/LIBERO/logs/libero-base_line/libero_10`, same command
+shape as above. Per user request, videos and the round-trip log went under
+`examples/LIBERO/logs/sim_eval_videos/libero_10/` (in-repo) instead of `/tmp`.
+
+| Task | RTC | Baseline |
+|---|---|---|
+| LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket | 9/10 | 9/10 |
+| LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket | 10/10 | 8/10 |
+| KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it | 10/10 | 10/10 |
+| KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it | 10/10 | 9/10 |
+| LIVING_ROOM_SCENE5_...mug_on_the_left_plate_and...mug_on_the_right_plate | 10/10 | 10/10 |
+| STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy | 11/11 | 11/11 |
+| LIVING_ROOM_SCENE6_...mug_on_the_plate_and...chocolate_pudding... | 8/10 | 9/10 |
+| LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket | 10/10 | 10/10 |
+| KITCHEN_SCENE8_put_both_moka_pots_on_the_stove | 7/10 | 8/11 |
+| KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it | 7/10 | 10/10 |
+| **Overall (sum successes / sum episodes)** | **92/101 = 91.1%** | **94/102 = 92.2%** |
+
+(Episode counts of 10 or 11 rather than a flat 10 come from the vectorized collector: with
+5 parallel envs and `--n-episodes 10`, individual envs finish at slightly different times,
+so the batch occasionally collects one extra episode before stopping — not a bug, just how
+`rollout_policy.py`'s vectorized loop terminates.)
+
+**This is a genuinely mixed, informative result** — unlike Goal's clean sweep. RTC and
+baseline are statistically close overall (91.1% vs. 92.2%, a 2-episode difference out of
+~100), each winning some tasks and losing others: RTC clearly ahead on
+`put_both_the_cream_cheese_box_and_the_butter` (10/10 vs. 8/10) and
+`put_the_black_bowl_in_the_bottom_drawer` (10/10 vs. 9/10), clearly behind on
+`put_the_yellow_and_white_mug_in_the_microwave` (7/10 vs. 10/10) and roughly tied
+(within 1 episode) elsewhere. **No consistent direction** — this reads as within-noise
+parity between RTC and non-RTC training on this suite, not evidence that RTC training
+helps or hurts long-horizon task performance either way at this scale.
+
+**Round-trip diagnostic**: 1755 rows logged (`libero_10_rtc_benchmark.jsonl`), same flat
+pattern across depths as Goal (means 1.603 / 1.603 / 1.604 for depths 1/2/4) and the same
+`roll`-dominates-per-key pattern (mean MSE 7.67, next highest `pitch` at 1.81, everything
+else <0.1). **Attempted to correlate per-task $\mathcal{C}_i$ against the two weak RTC
+tasks (KITCHEN_SCENE8 at 7/10, KITCHEN_SCENE6 at 7/10) and could not** — the JSONL schema
+has no task/episode field, and the only available proxy (segmenting rows by detecting
+`call_index` resets per `env_slot`, on the theory that a new `rollout_policy.py` client
+connecting triggers exactly one `RoundTripMonitor.reset()` per task) produced far more
+segments (46) than tasks (10), because **individual env slots' `call_index` also appears to
+reset mid-task**, most likely because `RoundTripMonitor` identifies an env purely by its
+*positional* index in the batched observation (`range(batch_size)`), and the vectorized
+collector's batch can shrink as individual sub-envs finish their share of the episode quota
+before others — reassigning what looks like "slot 2" to a different underlying environment
+mid-rollout. **This is a real, previously-undocumented limitation of Mechanism 1's current
+identity tracking**, not a data-quality issue with this run: a future improvement would tag
+each JSONL row with a stable per-episode/task identifier (passed through `options`, if the
+client is willing to supply one) rather than relying on positional batch index across calls.
+
 ### Caveats (closed-loop-specific, found running this for real)
 
 1. **`MUJOCO_EGL_DEVICE_ID` must be set to a plain integer for any `rollout_policy.py`
