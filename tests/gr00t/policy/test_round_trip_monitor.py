@@ -142,8 +142,20 @@ class TestIntervalAndDepthBookkeeping:
         rows = [json.loads(line) for line in log_path.read_text().splitlines()]
         assert len(rows) == 3
         for row in rows:
-            assert set(row.keys()) == {"env_slot", "call_index", "depth", "c_i", "per_key"}
+            assert set(row.keys()) == {
+                "env_slot",
+                "call_index",
+                "depth",
+                "c_i",
+                "episode_id",
+                "task",
+                "per_key",
+            }
             assert row["env_slot"] == 0
+            # No round_trip_episode_ids/round_trip_task supplied in this test -
+            # both fields log as null, same as a client that's never heard of them.
+            assert row["episode_id"] is None
+            assert row["task"] is None
             # "gripper" has a dimension-mismatched state/action pair (2 vs 1) -
             # excluded from per_key, same as state_action_processor.apply_reversed.
             assert set(row["per_key"].keys()) == {"x"}
@@ -195,6 +207,94 @@ class TestExactRecoveryDepth1:
         assert len(rows) == 3
         for row in rows:
             assert row["c_i"] == pytest.approx(0.0, abs=1e-6)
+
+
+class TestEpisodeIdAndTask:
+    """options["round_trip_episode_ids"] / options["round_trip_task"] - see
+    round_trip_monitor.py's "Per-episode and per-task identity" section."""
+
+    def test_task_and_episode_id_logged_when_supplied(self, tmp_path):
+        log_path = tmp_path / "rtc.jsonl"
+        policy = _StubPolicy(action_dims={"x": 1})
+        monitor = RoundTripMonitor(
+            policy,
+            round_trip_check_interval=1,
+            round_trip_depths=[1],
+            round_trip_log_path=str(log_path),
+        )
+        options = {"round_trip_task": "libero_sim/some_task", "round_trip_episode_ids": ["0:0"]}
+        monitor.get_action(_obs({"x": 1.0}), options=options)
+        monitor.get_action(_obs({"x": 2.0}), options=options)
+
+        rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["task"] == "libero_sim/some_task"
+        assert rows[0]["episode_id"] == "0:0"
+
+    def test_round_trip_keys_stripped_before_forwarding(self):
+        """The wrapped policy must never see round_trip_task/round_trip_episode_ids
+        - those are this monitor's own bookkeeping, not the model's options contract."""
+        seen_options = []
+
+        class _RecordingPolicy(_StubPolicy):
+            def _get_action(self, observation, options=None):
+                seen_options.append(options)
+                return super()._get_action(observation, options)
+
+        policy = _RecordingPolicy(action_dims={"x": 1})
+        monitor = RoundTripMonitor(policy, round_trip_check_interval=1, round_trip_depths=[1])
+        monitor.get_action(
+            _obs({"x": 1.0}),
+            options={
+                "round_trip_task": "t",
+                "round_trip_episode_ids": ["0:0"],
+                "some_other_key": 1,
+            },
+        )
+        assert seen_options == [{"some_other_key": 1}]
+
+    def test_episode_id_change_clears_stale_history(self, tmp_path):
+        """A new episode starting in the same env slot (gymnasium's inline
+        autoreset) must not let a round-trip window span the boundary."""
+        log_path = tmp_path / "rtc.jsonl"
+        policy = _StubPolicy(action_dims={"x": 1})
+        monitor = RoundTripMonitor(
+            policy,
+            round_trip_check_interval=1,
+            round_trip_depths=[1],
+            round_trip_log_path=str(log_path),
+        )
+        opts_ep0 = {"round_trip_episode_ids": ["0:0"]}
+        opts_ep1 = {"round_trip_episode_ids": ["0:1"]}
+
+        # Two calls in episode 0 build up history...
+        monitor.get_action(_obs({"x": 1.0}), options=opts_ep0)
+        monitor.get_action(_obs({"x": 2.0}), options=opts_ep0)
+        assert len(log_path.read_text().splitlines()) == 1  # one valid depth=1 check so far
+
+        # ...then episode 1 starts in the SAME slot with no explicit reset() call.
+        # Without episode-id tracking this would spuriously round-trip against
+        # episode 0's last state; with it, history is cleared and no row logs.
+        monitor.get_action(_obs({"x": 100.0}), options=opts_ep1)
+        rows_after_boundary = log_path.read_text().splitlines()
+        assert len(rows_after_boundary) == 1  # unchanged: no valid target in the new episode yet
+
+    def test_episode_ids_optional_no_behavior_change_when_absent(self, tmp_path):
+        """A client that never supplies round_trip_episode_ids (e.g. RoboLab) sees
+        identical behavior to before this feature existed."""
+        log_path = tmp_path / "rtc.jsonl"
+        policy = _StubPolicy(action_dims={"x": 1})
+        monitor = RoundTripMonitor(
+            policy,
+            round_trip_check_interval=1,
+            round_trip_depths=[1],
+            round_trip_log_path=str(log_path),
+        )
+        for i in range(3):
+            monitor.get_action(_obs({"x": float(i)}))  # no options at all
+        rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert len(rows) == 2
+        assert all(r["episode_id"] is None and r["task"] is None for r in rows)
 
 
 class TestResetClearsHistory:

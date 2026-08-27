@@ -284,11 +284,18 @@ def _collect_rollout_episodes(
     n_episodes: int,
     n_envs: int,
     seed: int | None,
+    env_name: str = "",
 ):
     """Run the rollout loop and return ``(successes, lengths, rewards, infos)``.
 
     Owns the progress bar and the initial / inter-episode env resets; the
     caller owns env teardown so ``env.close()`` still runs if this raises.
+
+    ``env_name`` is optional and purely additive: it's forwarded to the policy
+    as ``options["round_trip_task"]``/``options["round_trip_episode_ids"]`` for
+    RoundTripMonitor's benefit (see gr00t/policy/round_trip_monitor.py's
+    "Per-episode and per-task identity" section) - a plain policy that doesn't
+    look for those keys is unaffected.
     """
     episode_lengths: list[int] = []
     episode_rewards: list[float] = []
@@ -298,6 +305,23 @@ def _collect_rollout_episodes(
     current_successes = [False] * n_envs
     episode_successes = []
     episode_infos = defaultdict(list)
+    # One counter per env-batch slot, incremented exactly when that slot's
+    # episode ends (same event as the episode_lengths/rewards/successes
+    # bookkeeping below) - gives RoundTripMonitor a way to detect gymnasium's
+    # inline autoreset starting a new episode in the same slot mid-rollout,
+    # which positional slot index alone can't reveal. A fresh options dict is
+    # built per get_action call (below) rather than mutating one shared
+    # instance in place, so nothing downstream can observe a call's episode
+    # ids changing retroactively after the fact.
+    round_trip_episode_counters = [0] * n_envs
+
+    def _round_trip_options() -> dict:
+        return {
+            "round_trip_task": env_name,
+            "round_trip_episode_ids": [
+                f"{i}:{c}" for i, c in enumerate(round_trip_episode_counters)
+            ],
+        }
 
     # Initial reset; if a seed is provided, give each sub-env a distinct but
     # deterministic seed so that parallel workers don't all start from the
@@ -312,7 +336,7 @@ def _collect_rollout_episodes(
     pbar = tqdm(total=n_episodes, desc="Episodes")
     try:
         while completed_episodes < n_episodes:
-            actions, _ = policy.get_action(observations)
+            actions, _ = policy.get_action(observations, options=_round_trip_options())
             next_obs, rewards, terminations, truncations, env_infos = env.step(actions)
             # NOTE (FY): Currently we don't properly handle policy reset. For now, our policy are stateless,
             # but in the future if we need policy to be stateful, we need to detect env reset and call policy.reset()
@@ -386,6 +410,10 @@ def _collect_rollout_episodes(
                     # static type silently flips int <-> float across iterations.
                     current_rewards[env_idx] = 0.0
                     current_lengths[env_idx] = 0
+                    # A new episode starts in this slot next step (gymnasium's
+                    # inline autoreset) - bump its id so RoundTripMonitor can
+                    # tell, even though env_idx itself doesn't change.
+                    round_trip_episode_counters[env_idx] += 1
             observations = next_obs
 
         # Best-effort: a failed final reset must not skip the caller's env.close().
@@ -454,7 +482,7 @@ def run_rollout_gymnasium_policy(
     # every exit path; a leaked child blocks the next eval shard's ports/GPUs.
     try:
         episode_successes, episode_lengths, episode_rewards, episode_infos = (
-            _collect_rollout_episodes(env, policy, n_episodes, n_envs, seed)
+            _collect_rollout_episodes(env, policy, n_episodes, n_envs, seed, env_name=env_name)
         )
     finally:
         # Don't let a teardown error mask an in-flight rollout exception.

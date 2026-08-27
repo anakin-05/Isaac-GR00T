@@ -35,15 +35,43 @@ directly in gr00t_policy.py - no server/RPC changes needed). Enable it by wrappi
 constructed policy before handing it to ``PolicyServer`` (see
 ``gr00t/eval/run_gr00t_server.py``'s ``--enable-round-trip-monitor`` flag).
 
+Per-episode and per-task identity (both optional, both additive)
+------------------------------------------------------------------
+By default this monitor identifies an env purely by its *positional* index in the batched
+observation (``range(batch_size)``). That's stable for one ``gr00t/eval/rollout_policy.py``
+run against a fixed ``n_envs`` (confirmed by reading ``_collect_rollout_episodes`` - the
+per-env-index loop never resizes), but it can't tell when gymnasium's inline autoreset
+silently starts a *new episode* in the same slot mid-rollout, nor which task a given row
+belongs to when many tasks run sequentially against one long-lived server (as in a
+multi-task benchmark). A caller that wants either can pass, alongside the usual
+``direction``/``drop_vision`` keys:
+
+- ``options["round_trip_episode_ids"]``: a list of length ``batch_size``, one opaque
+  per-slot identifier that changes exactly when that slot starts a new episode (e.g.
+  ``f"{env_idx}:{episode_counter}"``). When a slot's incoming id differs from the one
+  cached from its previous call, this monitor clears that slot's history immediately -
+  a round-trip window can then never span an undetected episode boundary, closing the
+  gap the per-slot-``reset()``-granularity caveat below describes. ``rollout_policy.py``
+  supplies this (see its own ``round_trip_episode_ids`` bookkeeping).
+- ``options["round_trip_task"]``: a constant string for the whole rollout (e.g. the
+  ``env_name``), logged verbatim into every JSONL row's ``"task"`` field, so rows from a
+  multi-task benchmark against one server can be grouped without guessing from timing.
+
+Both are extracted and stripped before ``options`` is forwarded to the wrapped policy (the
+model layer has no use for them), and both default to ``None`` when absent - a client that
+never sets them (RoboLab, or any caller written before this existed) sees no behavior
+change: same positional-slot tracking, ``"episode_id"``/``"task"`` simply log as ``null``.
+
 Caveats (see the plan for the full discussion):
 - **Per-slot ``reset()`` granularity is unconfirmed and, in the one client actually checked
   (``gr00t/eval/rollout_policy.py``), not exercised at all mid-rollout**: that script calls
   ``policy.reset()`` exactly once, with no arguments, before the rollout loop begins - it
   does not detect or forward individual sub-env auto-resets within a vectorized batch. This
   monitor therefore clears every slot's history on *any* ``reset()`` call rather than guess
-  which slot(s) it refers to; a round-trip window that happens to span an undetected episode
-  boundary will compare states from two different episodes. Depth `i` windows are short
-  relative to typical episode lengths, so this is a rare, not systemic, contamination.
+  which slot(s) it refers to. Without ``round_trip_episode_ids`` (above), a round-trip
+  window that happens to span an undetected episode boundary will compare states from two
+  different episodes; depth `i` windows are short relative to typical episode lengths, so
+  this is a rare, not systemic, contamination even then.
 - **One extra ``get_action`` call per env slot every ``round_trip_check_interval`` calls is a
   real, non-optional compute cost** (e.g. +12.5% at interval=8) - budget for it.
 - **``drop_vision=True`` is intentional, not a shortcut**: the model was only ever trained
@@ -129,9 +157,29 @@ def _reconstructed_last_step(value: Any) -> np.ndarray:
     return arr.reshape(-1, arr.shape[-1])[-1]
 
 
+def _extract_round_trip_options(
+    options: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, list[str] | None, str | None]:
+    """Split an incoming options dict into (options to forward downstream,
+    per-slot episode ids, task label) - see module docstring's "Per-episode
+    and per-task identity" section. Both extras are optional and additive:
+    a client that never sets them (e.g. RoboLab) sees no behavior change."""
+    if options is None:
+        return None, None, None
+    episode_ids = options.get("round_trip_episode_ids")
+    task = options.get("round_trip_task")
+    if episode_ids is None and task is None:
+        return options, None, None
+    forwarded = {
+        k: v for k, v in options.items() if k not in ("round_trip_episode_ids", "round_trip_task")
+    }
+    return (forwarded or None), episode_ids, task
+
+
 @dataclass
 class _SlotState:
     call_index: int = 0
+    episode_id: str | None = None
     history: deque[tuple[int, dict[str, np.ndarray]]] = field(default_factory=deque)
 
 
@@ -180,17 +228,20 @@ class RoundTripMonitor(PolicyWrapper):
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        action, info = self.policy.get_action(observation, options)
+        forwarded_options, episode_ids, task = _extract_round_trip_options(options)
+        action, info = self.policy.get_action(observation, forwarded_options)
 
         try:
-            self._maybe_check_round_trip(observation)
+            self._maybe_check_round_trip(observation, episode_ids, task)
         except Exception:
             # The diagnostic must never take down real closed-loop control.
             logger.exception("RoundTripMonitor: round-trip check failed; continuing without it.")
 
         return action, info
 
-    def _maybe_check_round_trip(self, observation: dict[str, Any]) -> None:
+    def _maybe_check_round_trip(
+        self, observation: dict[str, Any], episode_ids: list[str] | None, task: str | None
+    ) -> None:
         state = _modality_dict(observation, "state")
         batch_size = _batch_size(observation)
         action_modality = self.policy.get_modality_config()["action"]
@@ -204,6 +255,22 @@ class RoundTripMonitor(PolicyWrapper):
 
         for slot in range(batch_size):
             slot_state = self._slots.setdefault(slot, _SlotState())
+            new_episode_id = episode_ids[slot] if episode_ids is not None else None
+            if (
+                new_episode_id is not None
+                and slot_state.episode_id is not None
+                and new_episode_id != slot_state.episode_id
+            ):
+                # A caller-supplied episode id changed under this slot without an
+                # explicit reset() call - e.g. gymnasium's inline autoreset starting
+                # a new episode in the same env-batch position mid-rollout. Clear
+                # this slot's history so no round-trip window spans the boundary;
+                # see the module docstring's "Per-episode and per-task identity"
+                # section for why positional slot index alone can't catch this.
+                slot_state.history.clear()
+            if new_episode_id is not None:
+                slot_state.episode_id = new_episode_id
+
             call_index = slot_state.call_index
             true_state = {key: _last_timestep(np.asarray(arr[slot])) for key, arr in state.items()}
             slot_state.history.append((call_index, true_state))
@@ -226,6 +293,8 @@ class RoundTripMonitor(PolicyWrapper):
                         action_keys,
                         key_to_state_key,
                         history_by_index,
+                        slot_state.episode_id,
+                        task,
                     )
 
             slot_state.call_index = call_index + 1
@@ -238,6 +307,8 @@ class RoundTripMonitor(PolicyWrapper):
         action_keys: list[str],
         key_to_state_key: dict[str, str],
         history_by_index: dict[int, dict[str, np.ndarray]],
+        episode_id: str | None,
+        task: str | None,
     ) -> None:
         single_obs = _slice_observation(observation, slot)
         backward_action, _ = self.policy.get_action(
@@ -271,6 +342,8 @@ class RoundTripMonitor(PolicyWrapper):
                     "call_index": call_index,
                     "depth": depth,
                     "c_i": float(np.mean(list(per_key.values()))),
+                    "episode_id": episode_id,
+                    "task": task,
                     "per_key": per_key,
                 }
             )
