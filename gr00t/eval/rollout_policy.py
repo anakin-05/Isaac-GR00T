@@ -394,6 +394,15 @@ def _collect_rollout_episodes(
                     episode_lengths.append(current_lengths[env_idx])
                     episode_rewards.append(float(current_rewards[env_idx]))
                     episode_successes.append(current_successes[env_idx])
+                    # Same completion-order convention as the three lists above -
+                    # index-aligned with episode_successes - so a round-trip log's
+                    # "episode_id" column (see round_trip_monitor.py) can be joined
+                    # back to this episode's actual outcome. Captured BEFORE the
+                    # counter bumps below, i.e. this is the id of the episode that
+                    # JUST ended, not the one about to start.
+                    episode_infos["round_trip_episode_id"].append(
+                        f"{env_idx}:{round_trip_episode_counters[env_idx]}"
+                    )
                     # Reset trackers for this environment.
                     current_successes[env_idx] = False
                     # only update completed_episodes if valid

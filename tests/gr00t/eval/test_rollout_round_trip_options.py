@@ -101,3 +101,22 @@ def test_round_trip_task_defaults_to_empty_string():
     _collect_rollout_episodes(env, policy, n_episodes=1, n_envs=2, seed=None)
 
     assert policy.seen_options[0]["round_trip_task"] == ""
+
+
+def test_episode_infos_records_the_id_of_the_episode_that_just_ended():
+    """episode_infos["round_trip_episode_id"] must be index-aligned with
+    episode_successes/episode_lengths/episode_rewards (same completion-order
+    convention as task_progress/q_score above it), so a round-trip JSONL log's
+    per-episode C_i can be joined back to whether that episode actually
+    succeeded - the whole point of adding this field."""
+    policy = _FakePolicy()
+    env = _FakeEnv()
+
+    successes, lengths, rewards, episode_infos = _collect_rollout_episodes(
+        env, policy, n_episodes=2, n_envs=2, seed=None, env_name="my_task"
+    )
+
+    assert len(successes) == len(lengths) == len(rewards) == 2
+    # Env 0's episode ends first (step 1), env 1's second (step 2) - the id
+    # recorded is the one that JUST ended (counter value before the bump).
+    assert episode_infos["round_trip_episode_id"] == ["0:0", "1:0"]
