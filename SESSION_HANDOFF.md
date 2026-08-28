@@ -90,16 +90,29 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
     **Verified live**: a 6-episode/3-env rollout showed every slot logging exactly two
     distinct episode ids, confirming the fix catches a real autoreset boundary. See
     `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s corrected writeup for the full story.
+  - **Reran LIBERO 10 (Long) at n_episodes=50** (5x the episodes, for a firmer comparison)
+    and used the per-episode-ID fix above to actually answer the C_i-vs-outcome question the
+    n=10 run couldn't. **Overall: RTC 452/500 (90.4%) vs. baseline 467/501 (93.2%)** —
+    baseline leads by ~2.8 points, a clearer gap than n=10 suggested (RTC wins only 3/10
+    tasks outright, ties 1, trails 6). **C_i-vs-outcome: failed episodes ran hotter on
+    average (mean C_i 1.709, n=48) than succeeded ones (mean C_i 1.569, n=452)** — a real
+    but modest, noisy signal, consistent in direction on 6 of 9 tasks with failures (most
+    clearly the two hardest tasks) but reversed on 2 — not a reliable per-episode failure
+    predictor. Full table, per-task breakdown, and the reusable analysis script are in
+    `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s new subsection under the LIBERO 10 section.
 - **Last state before this update**: all fixes verified (CPU suite: 750 passed, 9
   skipped, same 2 pre-existing unrelated environmental failures as always — a stray nested venv
   under `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a
   missing `HF_TOKEN` env var for one edge-device test — neither is a regression from this
   session), Step 0/1/2 (droid_sample), the LIBERO production-scale fine-tune, and both LIBERO
-  closed-loop benchmarks (Goal and 10/Long) are all complete with real numbers recorded.
-  **Open decision for the next session**: implement Mechanism 2 if per-episode C_i
-  correlation is wanted (now more clearly motivated, since Mechanism 1's positional-index
-  limitation makes per-task C_i attribution unreliable as-is), or add a stable per-episode ID
-  to Mechanism 1's JSONL rows directly — see §5 below.
+  closed-loop benchmarks (Goal and 10/Long, the latter at both n=10 and n=50) are all complete
+  with real numbers recorded, including the C_i-vs-outcome correlation the per-episode-ID fix
+  was built to unblock.
+  **Open decision for the next session**: Mechanism 2 (client-side hook) is still not
+  implemented; Mechanism 1 plus the per-episode-ID fix turned out sufficient to answer the
+  correlation question for LIBERO, so Mechanism 2 is now optional rather than blocking —
+  revisit only if RoboCasa/RoboCasa-GR1 need the same analysis and can't route through
+  Mechanism 1 for some reason. See §5 below.
 
 ## 2. Working agreements from this session (apply these on the new machine too)
 

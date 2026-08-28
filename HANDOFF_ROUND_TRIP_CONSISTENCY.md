@@ -489,6 +489,62 @@ unblocks exactly the per-task correlation this section originally couldn't do - 
 benchmark run can now group its JSONL log by `task`/`episode_id` directly instead of
 guessing from `call_index` resets.
 
+### LIBERO 10 (Long) rerun at n_episodes=50, with the per-episode-ID correlation this unblocked
+
+Reran the same RTC-vs-baseline comparison above with `--n-episodes 50` per task (5x the
+episodes) for a statistically firmer comparison, and — now that per-episode identity is
+logged — to actually answer the C_i-vs-outcome question the n=10 run couldn't. Videos and
+the round-trip log went to `examples/LIBERO/logs/sim_eval_videos/libero_10_n50/`.
+
+| Task | RTC (succ/n) | Baseline (succ/n) |
+|---|---|---|
+| LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket | 43/50 | 50/50 |
+| LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket | 48/50 | 49/51 |
+| KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it | 48/50 | 44/50 |
+| KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it | 46/50 | 49/50 |
+| LIVING_ROOM_SCENE5_...mug_on_the_left_plate_and...mug_on_the_right_plate | 46/50 | 47/50 |
+| STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy | 49/50 | 48/50 |
+| LIVING_ROOM_SCENE6_...mug_on_the_plate_and...chocolate_pudding... | 41/50 | 45/50 |
+| LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket | 50/50 | 49/50 |
+| KITCHEN_SCENE8_put_both_moka_pots_on_the_stove | 38/50 | 43/50 |
+| KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it | 43/50 | 43/50 |
+| **Overall (sum successes / sum episodes)** | **452/500 = 90.4%** | **467/501 = 93.2%** |
+
+At 5x the sample size, the picture sharpens slightly against RTC: baseline now leads by
+~2.8 points overall (vs. a ~1-point gap at n=10), and RTC wins outright on only 3 of 10
+tasks (`KITCHEN_SCENE3`, `STUDY_SCENE1`, `LIVING_ROOM_SCENE1`), ties on 1
+(`KITCHEN_SCENE6`, 43/50 both), and trails on 6. The two RTC losses that stood out at n=10
+(`KITCHEN_SCENE8`, `KITCHEN_SCENE6`) both remain among RTC's weaker tasks at n=50, but
+`KITCHEN_SCENE6`'s gap closed entirely (43/50 both, vs. 7/10 vs. 10/10 at n=10) while
+`LIVING_ROOM_SCENE2_...tomato_sauce` opened a new, larger gap (43/50 vs. a clean 50/50) not
+visible at n=10 (9/10 vs. 9/10) — a reminder that individual n=10 task numbers were mostly
+noise. **Net read: direction-conditioned (RTC) training measurably trails the non-RTC
+baseline on LIBERO 10 closed-loop success at this checkpoint/scale**, not the
+within-noise parity the n=10 run suggested.
+
+**C_i-vs-outcome correlation** (the question the per-episode-ID fix was built to answer):
+joined each RTC task's completed-episode success list against the round-trip JSONL log's
+per-episode mean $\mathcal{C}_i$ (averaged over all depths and calls logged during that
+episode). Across all 500 RTC episodes:
+
+- **Failed episodes (n=48): mean $\mathcal{C}_i$ = 1.709**
+- **Succeeded episodes (n=452): mean $\mathcal{C}_i$ = 1.569**
+
+Failed episodes do run ~9% hotter on average — a real, directionally-consistent signal,
+not nothing — but it is modest and not universal: 6 of the 9 tasks with at least one
+failure show the same fail-higher-than-succeed pattern (most clearly on the two hardest
+tasks, `KITCHEN_SCENE8`: 1.94 fail vs. 1.81 succeed, and `KITCHEN_SCENE6`: 2.18 fail vs.
+1.87 succeed — both also the tasks with the highest raw $\mathcal{C}_i$ overall), while 2
+tasks show the *opposite* (`LIVING_ROOM_SCENE2_...tomato_sauce`: 1.30 fail vs. 1.49 succeed;
+`KITCHEN_SCENE3`: 1.29 fail vs. 1.51 succeed) and 1 is essentially tied. **Conclusion:
+$\mathcal{C}_i$ is a weak, noisy, population-level correlate of failure on this benchmark —
+useful as one signal among others (e.g. for the kind of hardest-task ranking it gets right
+above), not a reliable per-episode failure predictor** — the fail/succeed distributions
+plainly overlap far more than they separate. The full per-task breakdown and the analysis
+script used to produce these numbers are preserved at
+`/tmp/claude-1010/.../scratchpad/{libero_10_n50_benchmark_results.md,analyze_libero10_n50.py}`
+if this needs re-running against a different checkpoint or the depth-1/2/4 split.
+
 ### Caveats (closed-loop-specific, found running this for real)
 
 1. **`MUJOCO_EGL_DEVICE_ID` must be set to a plain integer for any `rollout_policy.py`
