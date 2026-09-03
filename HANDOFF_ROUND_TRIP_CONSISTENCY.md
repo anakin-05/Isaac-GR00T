@@ -545,6 +545,61 @@ script used to produce these numbers are preserved at
 `/tmp/claude-1010/.../scratchpad/{libero_10_n50_benchmark_results.md,analyze_libero10_n50.py}`
 if this needs re-running against a different checkpoint or the depth-1/2/4 split.
 
+### Reproduction scripts, and a seeded rerun confirming the above
+
+The manual benchmark chain above (launching each server/client pair by hand, one
+task at a time) is now a committed, one-command script instead of a one-off
+procedure: **`examples/LIBERO/eval_libero_10_rtc.sh`** here (with
+**`EVAL_LIBERO_10_RTC.md`** documenting it) and the equivalent
+**`examples/LIBERO/eval_libero_10.sh`** in the sibling `Isaac-GR00T-baseline`
+checkout for the non-RTC checkpoint. Each script starts its server, waits for a
+real "ready" signal (a successful TCP connect, not a fixed sleep — model loading
+completes before the server starts listening, so this is reliable), runs all 10
+LIBERO-10 tasks against it sequentially, and for each task saves the video, a JSON
+dump of `rollout_policy.py`'s `results` return value (parsed via
+`ast.literal_eval` off its printed `repr()`, not re-implemented), and a `tail -100`
+log — plus, for the RTC script, the round-trip JSONL log and a
+`correlation_summary.json` that runs the same fail-vs-succeed $\mathcal{C}_i$ join
+described above automatically. Both scripts always stop their server on exit
+(success, failure, or Ctrl-C) via a trap on the process group, and skip any task
+whose result JSON already exists on a rerun, so a killed run resumes instead of
+restarting from scratch.
+
+Using these two scripts with a fixed `--seed 42` (the ad-hoc benchmark above ran
+unseeded), reran the full RTC-vs-baseline comparison:
+
+| Task | RTC (succ/n) | Baseline (succ/n) |
+|---|---|---|
+| LIVING_ROOM_SCENE2_...tomato_sauce | 46/50 | **47/50** |
+| LIVING_ROOM_SCENE2_...cream_cheese_and_butter | 47/50 | **48/50** |
+| KITCHEN_SCENE3_stove_and_moka_pot | **48/50** | 47/50 |
+| KITCHEN_SCENE4_black_bowl_in_drawer | 43/50 | **50/50** |
+| LIVING_ROOM_SCENE5_two_mugs_on_plates | 43/50 | **48/50** |
+| STUDY_SCENE1_book_in_caddy | 47/50 | **48/50** |
+| LIVING_ROOM_SCENE6_mug_and_pudding | **46/50** | 45/50 |
+| LIVING_ROOM_SCENE1_soup_and_cream_cheese | **49/50** | 48/50 |
+| KITCHEN_SCENE8_both_moka_pots | 39/50 | **45/50** |
+| KITCHEN_SCENE6_mug_in_microwave | 42/50 | **45/50** |
+| **Overall (sum/sum)** | **450/500 = 90.0%** | **471/500 = 94.2%** |
+
+Same direction and similar magnitude as the unseeded n=50 run above (90.4% vs.
+93.2%): baseline leads by ~4 points, winning 7 of 10 tasks; RTC wins the other 3
+(`KITCHEN_SCENE3`, `LIVING_ROOM_SCENE6`, `LIVING_ROOM_SCENE1`). A single seed isn't
+enough to rule out variance entirely, but two independent runs (one unseeded, one
+seeded) landing on the same conclusion is more convincing than either alone.
+
+The C_i-vs-outcome correlation also replicated: **failed episodes (n=50) mean
+$\mathcal{C}_i$ = 1.737, succeeded episodes (n=450) mean $\mathcal{C}_i$ = 1.570**
+— failed episodes ran ~10.6% hotter, consistent in direction on 6 of 10 tasks
+(again clearest on the two hardest tasks, `KITCHEN_SCENE8`: 1.92 fail vs. 1.82
+succeed, and `KITCHEN_SCENE6`: 2.02 fail vs. 1.89 succeed) and reversed on 4. Same
+conclusion holds: a real but weak, noisy, population-level correlate of failure,
+not a reliable per-episode predictor. Full results are at
+`examples/LIBERO/logs/eval_results/libero_10-rtc/` here and
+`examples/LIBERO/logs/eval_results/libero_10/` in `Isaac-GR00T-baseline`
+(`summary.json`, `round_trip_consistency/correlation_summary.json`, per-task
+`results/*.json`, per-task `logs/*.log`, and videos).
+
 ### Caveats (closed-loop-specific, found running this for real)
 
 1. **`MUJOCO_EGL_DEVICE_ID` must be set to a plain integer for any `rollout_policy.py`

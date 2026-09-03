@@ -100,14 +100,41 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
     clearly the two hardest tasks) but reversed on 2 — not a reliable per-episode failure
     predictor. Full table, per-task breakdown, and the reusable analysis script are in
     `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s new subsection under the LIBERO 10 section.
+  - **Turned the manual benchmark procedure into committed, reusable scripts**:
+    `examples/LIBERO/eval_libero_10_rtc.sh` here (+ `EVAL_LIBERO_10_RTC.md`) and
+    `examples/LIBERO/eval_libero_10.sh` in the sibling `Isaac-GR00T-baseline` repo
+    (created there, +`EVAL_LIBERO_10.md`) — each starts its server (waiting for a
+    real "ready" TCP connect, not a fixed sleep), runs all 10 LIBERO-10 tasks
+    sequentially, saves videos + a JSON dump of each task's `results` + a tail-100
+    log, and (RTC only) the round-trip JSONL log plus an automated
+    C_i-vs-outcome `correlation_summary.json`. Both auto-resume a killed run
+    (skip tasks whose result JSON already exists) and always stop their server on
+    exit. Smoke-tested end-to-end before trusting either.
+  - **Note**: `Isaac-GR00T-base_line` was renamed to `Isaac-GR00T-baseline`
+    partway through this session, which broke its LIBERO sim venv (two absolute
+    paths baked in at `setup_libero.sh` time — a `gr00t.pth` file and LIBERO's own
+    editable-install `.pth` — plus `~/.libero/config.yaml`, all still pointing at
+    the old name). Fixed by rewriting those in place rather than rerunning setup;
+    documented in `EVAL_LIBERO_10.md`'s "If you move or rename this repo" section
+    for next time.
+  - **Reran the full RTC-vs-baseline comparison via these scripts with a fixed
+    `--seed 42`** (the n=50 run above was unseeded): **RTC 450/500 (90.0%) vs.
+    baseline 471/500 (94.2%)** — same direction and similar magnitude as the
+    unseeded run, baseline winning 7/10 tasks. C_i-vs-outcome also replicated:
+    failed episodes (n=50) mean C_i 1.737 vs. succeeded (n=450) mean C_i 1.570,
+    consistent on 6/10 tasks. Two independent runs (one unseeded, one seeded)
+    landing on the same conclusion is more convincing than either alone. Full
+    writeup in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s "Reproduction scripts, and a
+    seeded rerun confirming the above" subsection.
 - **Last state before this update**: all fixes verified (CPU suite: 750 passed, 9
   skipped, same 2 pre-existing unrelated environmental failures as always — a stray nested venv
   under `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a
   missing `HF_TOKEN` env var for one edge-device test — neither is a regression from this
   session), Step 0/1/2 (droid_sample), the LIBERO production-scale fine-tune, and both LIBERO
-  closed-loop benchmarks (Goal and 10/Long, the latter at both n=10 and n=50) are all complete
-  with real numbers recorded, including the C_i-vs-outcome correlation the per-episode-ID fix
-  was built to unblock.
+  closed-loop benchmarks (Goal and 10/Long, the latter at n=10, unseeded n=50, and seeded n=50
+  via the new reproduction scripts) are all complete with real numbers recorded, including the
+  C_i-vs-outcome correlation the per-episode-ID fix was built to unblock, replicated across two
+  independent n=50 runs.
   **Open decision for the next session**: Mechanism 2 (client-side hook) is still not
   implemented; Mechanism 1 plus the per-episode-ID fix turned out sufficient to answer the
   correlation question for LIBERO, so Mechanism 2 is now optional rather than blocking —
