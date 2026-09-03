@@ -168,6 +168,12 @@ extra backward-direction inference call per env slot every `round_trip_check_int
 calls (a real compute cost, not free), and does nothing for a checkpoint that wasn't trained
 with direction conditioning — don't enable it for a baseline (non-RTC) checkpoint.
 
+To run the full LIBERO-10 (Long) suite (all 10 tasks) against an RTC checkpoint in
+one command — including a JSON dump of each task's results, the round-trip JSONL
+log, and a C_i-vs-outcome correlation summary — instead of one task at a time by
+hand, see [`eval_libero_10_rtc.sh`](./eval_libero_10_rtc.sh) and
+[`EVAL_LIBERO_10_RTC.md`](./EVAL_LIBERO_10_RTC.md).
+
 # Full task list
 
 ## Libero 10 (Long)
