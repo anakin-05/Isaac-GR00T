@@ -157,6 +157,41 @@ def _reconstructed_last_step(value: Any) -> np.ndarray:
     return arr.reshape(-1, arr.shape[-1])[-1]
 
 
+def reconstruct_last_timesteps_batched(value: Any) -> np.ndarray:
+    """(B, H, D) -> (B, D): the last-timestep round-trip estimate for every batch
+    row at once. Companion to ``_reconstructed_last_step`` for Mechanism 2
+    (``gr00t/eval/rollout_policy.py``'s client-side hook), which issues one
+    backward query for the *whole* vectorized batch instead of one per env slot
+    (this monitor's approach), so it needs each row's answer kept apart rather
+    than collapsed to a single row. Always the real Gr00tPolicy ``(B, H, D)``
+    contract here - Mechanism 2 only ever calls through a real policy or
+    ``PolicyClient`` with batch size ``n_envs``, never the ``(H, D)`` mocked-stub
+    shape ``_reconstructed_last_step`` also has to tolerate for historical
+    reasons (see its own docstring)."""
+    arr = np.asarray(value)
+    return arr[:, -1, :]
+
+
+def action_key_to_state_key_map(policy: BasePolicy) -> tuple[list[str], dict[str, str]]:
+    """``(action_keys, {action_key: state_key})`` from a policy's modality config.
+
+    Shared by ``RoundTripMonitor`` (Mechanism 1) and Mechanism 2
+    (``gr00t/eval/rollout_policy.py``) so both map an action key back to the
+    state key it round-trips against identically - a checkpoint's
+    ``ActionConfig.state_key`` override (when an action key doesn't share its
+    name with the state key it corresponds to) must be honored the same way by
+    either mechanism, or their C_i numbers would not be comparable.
+    """
+    action_modality = policy.get_modality_config()["action"]
+    action_keys = action_modality.modality_keys
+    action_configs = action_modality.action_configs
+    if action_configs is not None:
+        return action_keys, {
+            k: (ac.state_key if ac.state_key else k) for k, ac in zip(action_keys, action_configs)
+        }
+    return action_keys, {k: k for k in action_keys}
+
+
 def _extract_round_trip_options(
     options: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, list[str] | None, str | None]:
@@ -244,14 +279,7 @@ class RoundTripMonitor(PolicyWrapper):
     ) -> None:
         state = _modality_dict(observation, "state")
         batch_size = _batch_size(observation)
-        action_modality = self.policy.get_modality_config()["action"]
-        action_keys = action_modality.modality_keys
-        action_configs = action_modality.action_configs
-        key_to_state_key = (
-            {k: (ac.state_key if ac.state_key else k) for k, ac in zip(action_keys, action_configs)}
-            if action_configs is not None
-            else {k: k for k in action_keys}
-        )
+        action_keys, key_to_state_key = action_key_to_state_key_map(self.policy)
 
         for slot in range(batch_size):
             slot_state = self._slots.setdefault(slot, _SlotState())

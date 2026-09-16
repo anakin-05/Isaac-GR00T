@@ -126,7 +126,39 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
     landing on the same conclusion is more convincing than either alone. Full
     writeup in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s "Reproduction scripts, and a
     seeded rerun confirming the above" subsection.
-- **Last state before this update**: all fixes verified (CPU suite: 750 passed, 9
+  - **Implemented Mechanism 2** (client-side hook in `_collect_rollout_episodes`,
+    `gr00t/eval/rollout_policy.py`) — new `RolloutConfig` fields
+    `--enable-round-trip-check`/`--round-trip-check-interval`/`--round-trip-depths`
+    (default off). Every `round_trip_check_interval` macro-steps it issues **one
+    batched** backward-direction `get_action` call covering every env slot at once
+    (not one call per slot like `RoundTripMonitor`/Mechanism 1 — this loop already
+    knows its batch is `n_envs` wide), and appends each episode's mean C_i directly
+    into `episode_infos[f"round_trip_c_i_depth{depth}"]` when that episode ends —
+    since this function owns episode boundaries directly, it just clears that slot's
+    history ring buffer at episode end, with no need for Mechanism 1's
+    `round_trip_episode_ids` cross-referencing trick. Factored two small helpers
+    (`action_key_to_state_key_map`, `reconstruct_last_timesteps_batched`) out of
+    `round_trip_monitor.py` so both mechanisms compute C_i identically; refactored
+    `RoundTripMonitor` to use the first one too (behavior-preserving, its 10 existing
+    tests still pass unchanged). New `tests/gr00t/eval/test_rollout_round_trip_mechanism2.py`
+    (4 tests, mocked env/policy): disabled-is-a-no-op, exactly one batched call per
+    check, NaN recorded for an episode shorter than one check interval, and two
+    consecutive episodes with hand-computed exact C_i values proving no round-trip
+    window leaks across an episode boundary. Full CPU suite reran clean afterward:
+    765 passed, same 2 pre-existing unrelated failures as always, no regressions.
+    **Live-verified against a real checkpoint, same session**: ran both mechanisms
+    *simultaneously* against the same real closed-loop rollout (`libero_10-rtc`,
+    KITCHEN_SCENE3, 9 episodes/3 envs/150 max steps/seed 123 — server with
+    `--enable-round-trip-monitor`, client with `--enable-round-trip-check`, both at
+    `--round-trip-check-interval 8 --round-trip-depths 1 2 4`), grouped Mechanism 1's
+    JSONL log by `(episode_id, depth)`, and compared each group's mean C_i against
+    Mechanism 2's `episode_infos["round_trip_c_i_depth{depth}"]` for the same
+    episode: **27/27 (episode, depth) pairs agreed closely — max absolute diff
+    0.028, max relative diff 1.9%**, consistent with ordinary batch-size-dependent
+    floating-point non-determinism (one batched call of 3 vs. three single-env
+    calls), not a bug in either mechanism. Full writeup in
+    `HANDOFF_ROUND_TRIP_CONSISTENCY.md`'s Mechanism 2 subsection.
+- **Last state before this update**: all fixes verified (CPU suite: 765 passed, 9
   skipped, same 2 pre-existing unrelated environmental failures as always — a stray nested venv
   under `gr00t/eval/sim/LIBERO/libero_uv/` that confuses one test's source-scanning, and a
   missing `HF_TOKEN` env var for one edge-device test — neither is a regression from this
@@ -134,12 +166,17 @@ agreements/decisions, so a fresh Claude Code session on the new machine has full
   closed-loop benchmarks (Goal and 10/Long, the latter at n=10, unseeded n=50, and seeded n=50
   via the new reproduction scripts) are all complete with real numbers recorded, including the
   C_i-vs-outcome correlation the per-episode-ID fix was built to unblock, replicated across two
-  independent n=50 runs.
-  **Open decision for the next session**: Mechanism 2 (client-side hook) is still not
-  implemented; Mechanism 1 plus the per-episode-ID fix turned out sufficient to answer the
-  correlation question for LIBERO, so Mechanism 2 is now optional rather than blocking —
-  revisit only if RoboCasa/RoboCasa-GR1 need the same analysis and can't route through
-  Mechanism 1 for some reason. See §5 below.
+  independent n=50 runs. Mechanism 2 is now implemented, unit-tested, and live cross-validated
+  against Mechanism 1 on real hardware/sim (above) — both fully done.
+  **Open decision for the next session**: none blocking. Optional follow-ups: document
+  Mechanism 1/2's flags in `examples/robocasa/README.md` and
+  `examples/robocasa-gr1-tabletop-tasks/README.md` (currently undocumented there, low
+  priority until someone actually runs round-trip monitoring against one of those two
+  benchmarks), and/or use Mechanism 2 for a real C_i-vs-outcome correlation benchmark now
+  that it's validated (would get the same LIBERO-10 correlation answer Mechanism 1 already
+  gave, but in one pass via `episode_infos` instead of cross-referencing a JSONL log by id —
+  not expected to change the conclusion, just a cheaper way to get there next time). See §5
+  below.
 
 ## 2. Working agreements from this session (apply these on the new machine too)
 
@@ -342,25 +379,30 @@ from).
 
 The GPU fine-tune/eval deferral is resolved (§1 above) — Steps 0-2 (droid_sample), the LIBERO
 production-scale fine-tune, and both LIBERO closed-loop benchmarks (Goal, then the harder
-10/Long) are all complete, with real bugs found and fixed along the way, all committed. Goal
-came back a clean sweep (100/100 episodes, both RTC and baseline); 10/Long produced genuine
-failures and a close, no-consistent-direction result (RTC 91.1% vs. baseline 92.2% overall) —
-between them, this answers "does RTC training hurt forward-task performance" (no, on both
-suites tested).
+10/Long, at n=10, unseeded n=50, and seeded n=50) are all complete, with real bugs found and
+fixed along the way. Goal came back a clean sweep (100/100 episodes, both RTC and baseline);
+10/Long consistently shows the RTC checkpoint trailing the non-RTC baseline by a few points
+across three independent runs — answers "does RTC training hurt forward-task performance"
+(yes, modestly, on this suite/checkpoint; no, on Goal).
 
-**The per-episode-identity gap that blocked correlating C_i against failure is now fixed**
-(`RoundTripMonitor`/`rollout_policy.py`, `options["round_trip_episode_ids"]`/
-`["round_trip_task"]`, verified live — see §1 above). **What's still unanswered**: whether
-C_i actually predicts failure — the fix unblocks asking this, but nobody has yet re-run a
-benchmark with a genuine success/failure mix (like 10/Long) and actually grouped its JSONL
-log by the new `task`/`episode_id` fields to check the correlation. That's the natural next
-step, either on its own or alongside:
+**The per-episode-identity gap that blocked correlating C_i against failure is fixed and used**
+(`RoundTripMonitor`/`rollout_policy.py`'s `round_trip_episode_ids`/`round_trip_task`, verified
+live) — the seeded and unseeded n=50 LIBERO-10 runs both found the same pattern: C_i runs
+hotter on failed episodes than succeeded ones, a real but weak, noisy, population-level
+correlate of failure, not a reliable per-episode predictor.
 
-1. **Re-run (or reuse, if the log is still around) the LIBERO 10 benchmark and group
-   `libero_10_rtc_benchmark.jsonl` by `episode_id`/`task`** to see whether C_i is higher on
-   the episodes that actually failed (KITCHEN_SCENE8, KITCHEN_SCENE6 for RTC) — this is the
-   validation the round-trip-consistency mechanism exists for, now actually answerable.
-2. **Implement Mechanism 2** (§3 above, client-side hook in `rollout_policy.py`) — ties C_i
-   to per-episode/per-task success natively via `episode_infos` in one pass, rather than
-   cross-referencing two separate data sources by id; still the only path to RoboCasa-only
-   niceties Mechanism 1 doesn't need but RoboLab structurally can't use either way.
+**Mechanism 2 is now implemented, unit-tested, and live cross-validated** (§1 above) —
+ran both mechanisms simultaneously against the same real `libero_10-rtc` rollout and
+their independently-computed per-episode C_i values agreed to within ~2%, confirming both
+implementations compute the same math correctly. Nothing blocking remains from this
+session's original scope. Optional follow-ups, neither urgent:
+
+1. `examples/robocasa/README.md` and `examples/robocasa-gr1-tabletop-tasks/README.md` still
+   don't document either mechanism's flags — a pre-existing gap from Mechanism 1 that widened
+   to include Mechanism 2's flags too. Low priority unless someone is actually about to run
+   round-trip monitoring against one of those two benchmarks.
+2. Mechanism 2 could now be used for a real C_i-vs-outcome correlation benchmark (e.g. a
+   fresh LIBERO-10 n=50 run with `--enable-round-trip-check` instead of the server-side
+   monitor) — cheaper in plumbing (no JSONL cross-referencing needed, `episode_infos` has
+   everything already), though not expected to change the correlation conclusion already
+   established via Mechanism 1.

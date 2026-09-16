@@ -289,15 +289,17 @@ above. `--no-tune-projector` was never actually needed once on a ≥40 GB GPU �
 (DROID, 1000-step real fine-tune) and batch 32 (LIBERO, real 40658-step fine-tune, see
 below) both fit comfortably with the default `tune_projector=True`.
 
-## Done (Mechanism 1) — closed-loop evaluation extension, LIBERO benchmarked
+## Done (Mechanisms 1 & 2) — closed-loop evaluation extension, LIBERO benchmarked
 
 Everything in the "Done" sections above is **offline/open-loop only** (`open_loop_eval.py`
 replays a recorded trajectory, no live env). LIBERO, RoboCasa (+ RoboCasa GR1 Tabletop), and
 RoboLab all evaluate **closed-loop** (policy-in-the-loop via the server-client
-architecture). Mechanism 1 (below) is now implemented, tested, and verified against a real
+architecture). Mechanism 1 (below) is implemented, tested, and verified against a real
 LIBERO closed-loop benchmark; Mechanism 2 (the richer, LIBERO/RoboCasa-only client-side
-hook) is not implemented — Mechanism 1 alone was sufficient for the benchmark requested,
-and reaches RoboLab too, which Mechanism 2 structurally cannot.
+hook) is now also implemented and unit-tested (see its own subsection below) — Mechanism 1
+alone was sufficient for every benchmark run against real hardware so far and reaches
+RoboLab too, which Mechanism 2 structurally cannot, but Mechanism 2 is genuinely richer for
+the three benchmarks this repo's own client controls, so it was built anyway.
 
 ### The key finding: one mechanism can't cover all three
 
@@ -351,15 +353,67 @@ is unaffected. New tests in `tests/gr00t/eval/test_rollout_round_trip_options.py
 unit-tested) — see the LIBERO 10 section below for the corrected root-cause writeup and
 real evidence this actually works.
 
-**Mechanism 2** (client-side hook in `gr00t/eval/rollout_policy.py`, ties
-$\mathcal{C}_i$ to `episode_infos` natively for LIBERO/RoboCasa/RoboCasa-GR1
-specifically) — **still not implemented.** Mechanism 1 (now with the episode-id/task
-addition above) can already answer the per-task/per-episode correlation question that
-motivated Mechanism 2 in the first place, for the clients we control; Mechanism 2 remains
-worth building only if querying `episode_infos["task_progress"]`/`"q_score"` directly
-(rather than cross-referencing a separate JSONL log by task/episode-id) becomes valuable,
-or Mechanism 1's compute cost (one extra inference call per slot per interval, everywhere)
-needs to be avoided for benchmarks Mechanism 2 doesn't need to run.
+**Mechanism 2 — now implemented** (client-side hook in `_collect_rollout_episodes`,
+`gr00t/eval/rollout_policy.py`, ties $\mathcal{C}_i$ to `episode_infos` natively for
+LIBERO/RoboCasa/RoboCasa-GR1 specifically). Mechanism 1 (with the episode-id/task
+addition above) could already answer the per-task/per-episode correlation question that
+originally motivated Mechanism 2, so this was optional rather than blocking — implemented
+anyway since it's genuinely richer for the three benchmarks this repo's own client
+controls, and removes the need to cross-reference a separate JSONL log by id afterward.
+
+New `RolloutConfig` fields: `--enable-round-trip-check` (default off), matching
+`--round-trip-check-interval` (default 8) / `--round-trip-depths` (default `1 2 4`)
+conventions from Mechanism 1's server flags. When enabled, every
+`round_trip_check_interval` macro-steps the rollout loop issues **one batched**
+backward-direction `get_action` call covering every env slot at once — not one call per
+slot the way `RoundTripMonitor` has to (it can only see one request at a time, with no
+guarantee of how many envs share it; this loop already knows its own batch is
+`n_envs` wide) — computes each env's $\mathcal{C}_i$ against its own cached true state
+from `depth` calls ago, and appends the *mean* of whatever was computed during that
+episode into `episode_infos[f"round_trip_c_i_depth{{depth}}"]` when that env's episode
+ends (`NaN` if the episode ended before any check fired) — the same per-episode
+aggregation sink `"task_progress"`/`"q_score"` already use, so results surface in
+whatever summary a benchmark already produces, no new reporting plumbing needed.
+
+Because this function owns episode boundaries directly — unlike `RoundTripMonitor`,
+which has to infer them from the very `options["round_trip_episode_ids"]` this same
+function supplies — a round-trip window can never span an episode boundary without
+needing that id-based indirection at all: each env slot's history ring buffer is simply
+cleared the instant that slot's episode ends. Two small helpers
+(`action_key_to_state_key_map`, `reconstruct_last_timesteps_batched`) were factored out
+of `round_trip_monitor.py` so both mechanisms compute $\mathcal{C}_i$ identically instead
+of maintaining the key-mapping/reconstruction math twice — `RoundTripMonitor` itself was
+refactored to call the first one too (behavior-preserving; its existing 10 tests still
+pass unchanged).
+
+**Tested and verified live**: `tests/gr00t/eval/test_rollout_round_trip_mechanism2.py`
+(4 tests, mocked env/policy, CPU-safe) covers: disabled-by-default is a true no-op; exactly
+one batched backward call per check (the whole point of this mechanism over Mechanism 1);
+an episode shorter than one check interval still records one `NaN` entry (index-alignment
+preserved); and — the strongest one — two consecutive episodes with hand-computed exact
+expected $\mathcal{C}_i$ values (depth=1 reconstructs perfectly, depth=2 is off by exactly
+1), which would come out wrong if a round-trip window ever leaked across the episode
+boundary.
+
+**Live cross-validation against a real checkpoint**: ran both mechanisms *simultaneously*
+against the same real closed-loop rollout — `libero_10-rtc`,
+`KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it`, 9 episodes / 3 envs / 150 max
+steps / seed 123 — server with `--enable-round-trip-monitor` (Mechanism 1, logging to its
+own JSONL) and client with `--enable-round-trip-check` (Mechanism 2, populating
+`episode_infos`) both enabled at once, same `--round-trip-check-interval 8
+--round-trip-depths 1 2 4`. Grouped Mechanism 1's JSONL rows by `(episode_id, depth)` and
+compared each group's mean $\mathcal{C}_i$ against Mechanism 2's corresponding
+`episode_infos["round_trip_c_i_depth{depth}"]` entry for the same episode: **27 of 27
+(episode, depth) pairs matched closely — max absolute difference 0.028, max relative
+difference 1.9%, no order-of-magnitude or sign discrepancies anywhere.** The residual
+sub-2% differences are consistent with ordinary batch-size-dependent floating-point
+non-determinism (Mechanism 2 issues one batched backward call covering all 3 envs;
+Mechanism 1 issues three separate single-env calls for the same check) rather than a bug in
+either mechanism — this is exactly the outcome that validates both independently-written
+implementations compute the same $\mathcal{C}_i$ math. `examples/robocasa/README.md` and
+`examples/robocasa-gr1-tabletop-tasks/README.md` still don't document either mechanism's
+client flags — a pre-existing gap from Mechanism 1 that now also applies to Mechanism 2's
+`--enable-round-trip-check` et al.
 
 ### LIBERO Goal closed-loop benchmark: RTC vs. baseline (real sim, real rollouts)
 

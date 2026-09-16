@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
+import logging
 from pathlib import Path
 import sys
 import time
@@ -29,11 +30,20 @@ from gr00t.eval._horizon_contract import PolicyHorizonSpec
 from gr00t.eval.sim.env_utils import get_embodiment_tag_from_env_name
 from gr00t.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
 from gr00t.policy import BasePolicy
+from gr00t.policy.round_trip_monitor import (
+    _last_timestep,
+    _modality_dict,
+    action_key_to_state_key_map,
+    reconstruct_last_timesteps_batched,
+)
 from gr00t.utils.determinism import seed_everything
 import gymnasium as gym
 import numpy as np
 from tqdm import tqdm
 import tyro
+
+
+logger = logging.getLogger(__name__)
 
 
 ROBOCASA_PANDA_RECORD_VIDEO_KEYS = (
@@ -278,6 +288,80 @@ def _macro_step_env_steps(env_infos: dict, env_idx: int) -> int:
     return 0
 
 
+def _update_round_trip_state(
+    *,
+    policy: BasePolicy,
+    observations: dict[str, Any],
+    call_index: int,
+    n_envs: int,
+    history: list[deque[tuple[int, dict[str, np.ndarray]]]],
+    pending: list[dict[int, list[float]]],
+    max_depth: int,
+    check_interval: int,
+    depths: tuple[int, ...],
+    action_keys: list[str],
+    key_to_state_key: dict[str, str],
+) -> None:
+    """Mechanism 2's per-macro-step hook (see ``_collect_rollout_episodes``'s
+    docstring): cache this call's true state for every env slot, then every
+    ``check_interval`` calls issue *one* batched backward-direction query and
+    accumulate each env's C_i (per requested depth) into ``pending`` for that
+    env's in-progress episode. Mirrors ``RoundTripMonitor._check_slot``'s math
+    (Mechanism 1) but with a single batched call instead of one per env slot,
+    since this loop's observation is already naturally batched.
+    """
+    state = _modality_dict(observations, "state")
+    for slot in range(n_envs):
+        true_state = {key: _last_timestep(np.asarray(arr[slot])) for key, arr in state.items()}
+        history[slot].append((call_index, true_state))
+        while len(history[slot]) > max_depth + 1:
+            history[slot].popleft()
+
+    if (call_index + 1) % check_interval != 0:
+        return
+
+    histories_by_index = [dict(h) for h in history]
+    has_target = any(
+        (call_index - depth) in histories_by_index[slot]
+        for slot in range(n_envs)
+        for depth in depths
+    )
+    if not has_target:
+        # Nothing would be logged from the (expensive) backward query yet -
+        # e.g. still early in the rollout - so skip issuing it at all.
+        return
+
+    backward_action, _ = policy.get_action(
+        observations, options={"direction": 1, "drop_vision": True}
+    )
+    backward_state = _modality_dict(backward_action, "action")
+    reconstructed = {
+        key: reconstruct_last_timesteps_batched(backward_state[key])
+        for key in action_keys
+        if key in backward_state
+    }
+
+    for slot in range(n_envs):
+        for depth in depths:
+            cached = histories_by_index[slot].get(call_index - depth)
+            if cached is None:
+                continue
+            per_key: dict[str, float] = {}
+            for key in action_keys:
+                state_key = key_to_state_key[key]
+                if state_key not in cached or key not in reconstructed:
+                    continue
+                true_val = cached[state_key]
+                est_val = reconstructed[key][slot]
+                if true_val.shape != est_val.shape:
+                    # Same dimension-mismatch case state_action_processor.apply_reversed
+                    # already skips (e.g. LIBERO's "gripper") - no comparable anchor.
+                    continue
+                per_key[key] = float(np.mean((true_val - est_val) ** 2))
+            if per_key:
+                pending[slot][depth].append(float(np.mean(list(per_key.values()))))
+
+
 def _collect_rollout_episodes(
     env,
     policy: BasePolicy,
@@ -285,6 +369,9 @@ def _collect_rollout_episodes(
     n_envs: int,
     seed: int | None,
     env_name: str = "",
+    enable_round_trip_check: bool = False,
+    round_trip_check_interval: int = 8,
+    round_trip_depths: tuple[int, ...] = (1, 2, 4),
 ):
     """Run the rollout loop and return ``(successes, lengths, rewards, infos)``.
 
@@ -296,6 +383,31 @@ def _collect_rollout_episodes(
     RoundTripMonitor's benefit (see gr00t/policy/round_trip_monitor.py's
     "Per-episode and per-task identity" section) - a plain policy that doesn't
     look for those keys is unaffected.
+
+    ``enable_round_trip_check`` turns on Mechanism 2 (see
+    SESSION_HANDOFF.md's "Mechanism 2" design section): a client-side
+    round-trip-consistency diagnostic, complementary to the server-side
+    ``RoundTripMonitor`` (Mechanism 1). Every ``round_trip_check_interval``
+    macro-steps it issues one additional *batched* backward-direction
+    ``policy.get_action`` call (one call for the whole vectorized batch, not
+    one per env slot - this loop already has a naturally batched observation),
+    computes each env's C_i against its own cached true state from ``depth``
+    calls ago, and appends the *mean* of whatever C_i values were computed
+    during that episode into ``episode_infos[f"round_trip_c_i_depth{depth}"]``
+    when that env's episode ends (``float("nan")`` if none were - e.g. an
+    episode shorter than one check interval) - the same per-episode
+    aggregation sink ``"task_progress"``/``"q_score"`` already use, so results
+    surface in whatever summary a benchmark already produces, with no new
+    reporting plumbing. Because this function owns episode boundaries
+    directly (unlike Mechanism 1, which must infer them from the
+    ``round_trip_episode_ids`` this same function supplies via ``options``),
+    a round-trip window can never span an episode boundary without needing
+    that extra id-based bookkeeping: each env slot's own history ring buffer
+    is simply cleared the moment that slot's episode ends. Only meaningful
+    for a checkpoint trained with ``--enable-direction-conditioning``; adds a
+    real, non-optional compute cost identical to Mechanism 1's
+    (``round_trip_check_interval`` should be kept equal to the caller's
+    action-execution horizon, same reason and same caveat as Mechanism 1's).
     """
     episode_lengths: list[int] = []
     episode_rewards: list[float] = []
@@ -323,6 +435,20 @@ def _collect_rollout_episodes(
             ],
         }
 
+    # Mechanism 2 bookkeeping (see docstring above) - every piece here is a
+    # no-op when enable_round_trip_check is False.
+    round_trip_max_depth = max(round_trip_depths) if round_trip_depths else 0
+    round_trip_history: list[deque[tuple[int, dict[str, np.ndarray]]]] = [
+        deque() for _ in range(n_envs)
+    ]
+    round_trip_pending: list[dict[int, list[float]]] = [
+        {depth: [] for depth in round_trip_depths} for _ in range(n_envs)
+    ]
+    round_trip_action_keys: list[str] = []
+    round_trip_key_to_state_key: dict[str, str] = {}
+    if enable_round_trip_check:
+        round_trip_action_keys, round_trip_key_to_state_key = action_key_to_state_key_map(policy)
+
     # Initial reset; if a seed is provided, give each sub-env a distinct but
     # deterministic seed so that parallel workers don't all start from the
     # same initial state while still being run-to-run reproducible.
@@ -333,10 +459,31 @@ def _collect_rollout_episodes(
         observations, _ = env.reset()
     policy.reset()
 
+    call_index = 0
     pbar = tqdm(total=n_episodes, desc="Episodes")
     try:
         while completed_episodes < n_episodes:
             actions, _ = policy.get_action(observations, options=_round_trip_options())
+
+            if enable_round_trip_check:
+                try:
+                    _update_round_trip_state(
+                        policy=policy,
+                        observations=observations,
+                        call_index=call_index,
+                        n_envs=n_envs,
+                        history=round_trip_history,
+                        pending=round_trip_pending,
+                        max_depth=round_trip_max_depth,
+                        check_interval=round_trip_check_interval,
+                        depths=round_trip_depths,
+                        action_keys=round_trip_action_keys,
+                        key_to_state_key=round_trip_key_to_state_key,
+                    )
+                except Exception:
+                    # The diagnostic must never take down a real rollout.
+                    logger.exception("Mechanism 2 round-trip check failed; continuing without it.")
+
             next_obs, rewards, terminations, truncations, env_infos = env.step(actions)
             # NOTE (FY): Currently we don't properly handle policy reset. For now, our policy are stateless,
             # but in the future if we need policy to be stateful, we need to detect env reset and call policy.reset()
@@ -403,6 +550,19 @@ def _collect_rollout_episodes(
                     episode_infos["round_trip_episode_id"].append(
                         f"{env_idx}:{round_trip_episode_counters[env_idx]}"
                     )
+                    if enable_round_trip_check:
+                        # Mechanism 2: flush this episode's accumulated C_i values
+                        # (mean per depth, NaN if the episode ended before any
+                        # check fired) and clear this slot's history so the next
+                        # episode in this slot starts with a clean ring buffer -
+                        # no window can span the boundary that way.
+                        for depth in round_trip_depths:
+                            values = round_trip_pending[env_idx][depth]
+                            episode_infos[f"round_trip_c_i_depth{depth}"].append(
+                                float(np.mean(values)) if values else float("nan")
+                            )
+                            round_trip_pending[env_idx][depth] = []
+                        round_trip_history[env_idx].clear()
                     # Reset trackers for this environment.
                     current_successes[env_idx] = False
                     # only update completed_episodes if valid
@@ -424,6 +584,7 @@ def _collect_rollout_episodes(
                     # tell, even though env_idx itself doesn't change.
                     round_trip_episode_counters[env_idx] += 1
             observations = next_obs
+            call_index += 1
 
         # Best-effort: a failed final reset must not skip the caller's env.close().
         try:
@@ -444,6 +605,9 @@ def run_rollout_gymnasium_policy(
     n_envs: int = 1,
     seed: int | None = None,
     robocasa_split: str = "",
+    enable_round_trip_check: bool = False,
+    round_trip_check_interval: int = 8,
+    round_trip_depths: tuple[int, ...] = (1, 2, 4),
 ) -> Any:
     """Run policy rollouts in parallel environments.
 
@@ -457,6 +621,10 @@ def run_rollout_gymnasium_policy(
             ``env.reset`` so each sub-env is reproducible. Should be paired
             with :func:`gr00t.utils.determinism.seed_everything` upstream to
             also constrain policy-side RNGs.
+        enable_round_trip_check: Mechanism 2 - see
+            ``_collect_rollout_episodes``'s docstring for the full design.
+        round_trip_check_interval: Only used when ``enable_round_trip_check``.
+        round_trip_depths: Only used when ``enable_round_trip_check``.
     Returns:
         ``(env_name, episode_successes, episode_infos)``. ``episode_lengths``
         in ``episode_infos`` is in **env-steps** (inner ``super().step()``
@@ -491,7 +659,17 @@ def run_rollout_gymnasium_policy(
     # every exit path; a leaked child blocks the next eval shard's ports/GPUs.
     try:
         episode_successes, episode_lengths, episode_rewards, episode_infos = (
-            _collect_rollout_episodes(env, policy, n_episodes, n_envs, seed, env_name=env_name)
+            _collect_rollout_episodes(
+                env,
+                policy,
+                n_episodes,
+                n_envs,
+                seed,
+                env_name=env_name,
+                enable_round_trip_check=enable_round_trip_check,
+                round_trip_check_interval=round_trip_check_interval,
+                round_trip_depths=round_trip_depths,
+            )
         )
     finally:
         # Don't let a teardown error mask an in-flight rollout exception.
@@ -586,6 +764,9 @@ def run_gr00t_sim_policy(
     trt_mode: InferenceMode = InferenceMode.n17_full_pipeline,
     seed: int | None = None,
     robocasa_split: str = "",
+    enable_round_trip_check: bool = False,
+    round_trip_check_interval: int = 8,
+    round_trip_depths: tuple[int, ...] = (1, 2, 4),
 ):
     # seed_everything resolves `None` via the GR00T_EVAL_SEED env var and is a
     # no-op when that is also unset, so the historical non-deterministic
@@ -653,6 +834,9 @@ def run_gr00t_sim_policy(
             n_envs=n_envs,
             seed=seed,
             robocasa_split=robocasa_split,
+            enable_round_trip_check=enable_round_trip_check,
+            round_trip_check_interval=round_trip_check_interval,
+            round_trip_depths=round_trip_depths,
         )
         print("Video saved to: ", wrapper_configs.video.video_dir)
         return results
@@ -706,6 +890,27 @@ class RolloutConfig:
     robocasa_split: str = ""
     """Optional RoboCasa/RoboCasa365 split forwarded to the simulator."""
 
+    enable_round_trip_check: bool = False
+    """Mechanism 2: client-side round-trip-consistency diagnostic (see
+    _collect_rollout_episodes's docstring in this file). Ties C_i directly to
+    each episode's outcome via episode_infos, unlike the server-side
+    RoundTripMonitor (--enable-round-trip-monitor on run_gr00t_server.py),
+    which logs to a separate JSONL sidecar that must be cross-referenced by
+    episode id/task afterward. Only meaningful for a checkpoint trained with
+    --enable-direction-conditioning; only reaches this script's own client
+    loop (LIBERO/RoboCasa/RoboCasa-GR1) - RoboLab is an external client this
+    repo doesn't control, so it needs Mechanism 1 instead."""
+
+    round_trip_check_interval: int = 8
+    """Run Mechanism 2's diagnostic every this many macro-steps. Keep equal to
+    n_action_steps above, matching the same convention Mechanism 1 requires
+    and for the same reason: this loop has no way to notice a mismatch on its
+    own. Only used when enable_round_trip_check is set."""
+
+    round_trip_depths: tuple[int, ...] = (1, 2, 4)
+    """Rollout depths (in macro-steps) Mechanism 2 evaluates. Only used when
+    enable_round_trip_check is set."""
+
 
 if __name__ == "__main__":
     args = tyro.cli(RolloutConfig)
@@ -734,6 +939,9 @@ if __name__ == "__main__":
         trt_mode=args.trt_mode,
         seed=args.seed,
         robocasa_split=args.robocasa_split,
+        enable_round_trip_check=args.enable_round_trip_check,
+        round_trip_check_interval=args.round_trip_check_interval,
+        round_trip_depths=args.round_trip_depths,
     )
     print("results: ", results)
     print("success rate: ", np.mean(results[1]))
