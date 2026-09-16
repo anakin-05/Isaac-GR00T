@@ -78,6 +78,11 @@ class VideoConfig:
             during rollout
         fps: Frames per second for the output video
         codec: Video codec to use for compression
+        round_trip_depths: When set (Mechanism 2's --enable-round-trip-check),
+            the recorded video gets a second caption line showing each depth's
+            latest known C_i, and a per-episode C_i-vs-step plot is saved
+            alongside each kept video. None disables both - see
+            VideoRecordingWrapper.
     """
 
     video_dir: str | None = None
@@ -87,6 +92,7 @@ class VideoConfig:
     codec: str = "h264"
     overlay_text: bool = True
     record_video_keys: tuple[str, ...] | None = None
+    round_trip_depths: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -219,6 +225,8 @@ def create_eval_env(
             codec=wrapper_configs.video.codec,
             overlay_text=wrapper_configs.video.overlay_text,
             record_video_keys=record_video_keys,
+            round_trip_depths=wrapper_configs.video.round_trip_depths,
+            env_idx=env_idx,
         )
 
     env = MultiStepWrapper(
@@ -301,6 +309,8 @@ def _update_round_trip_state(
     depths: tuple[int, ...],
     action_keys: list[str],
     key_to_state_key: dict[str, str],
+    latest_ci: list[dict[int, float] | None] | None = None,
+    changed: list[bool] | None = None,
 ) -> None:
     """Mechanism 2's per-macro-step hook (see ``_collect_rollout_episodes``'s
     docstring): cache this call's true state for every env slot, then every
@@ -309,6 +319,18 @@ def _update_round_trip_state(
     env's in-progress episode. Mirrors ``RoundTripMonitor._check_slot``'s math
     (Mechanism 1) but with a single batched call instead of one per env slot,
     since this loop's observation is already naturally batched.
+
+    ``changed``, when given, has its single element set ``True`` exactly on
+    calls where ``latest_ci`` was actually updated - lets the caller skip
+    pushing an unchanged value to the video overlay on the (large majority
+    of) calls between checks.
+
+    ``latest_ci``, when given, is updated in place with the freshest
+    ``{depth: c_i}`` computed this call for each slot (a new dict replaces the
+    old one rather than mutating it, so a caller that handed a per-slot dict
+    off to something else - e.g. the video overlay below - never sees it
+    change under it) - purely for the video-overlay/plot feature, no effect
+    on ``pending``'s per-episode aggregation.
     """
     state = _modality_dict(observations, "state")
     for slot in range(n_envs):
@@ -359,7 +381,12 @@ def _update_round_trip_state(
                     continue
                 per_key[key] = float(np.mean((true_val - est_val) ** 2))
             if per_key:
-                pending[slot][depth].append(float(np.mean(list(per_key.values()))))
+                c_i = float(np.mean(list(per_key.values())))
+                pending[slot][depth].append(c_i)
+                if latest_ci is not None:
+                    latest_ci[slot] = {**(latest_ci[slot] or {}), depth: c_i}
+                    if changed is not None:
+                        changed[0] = True
 
 
 def _collect_rollout_episodes(
@@ -448,6 +475,17 @@ def _collect_rollout_episodes(
     round_trip_key_to_state_key: dict[str, str] = {}
     if enable_round_trip_check:
         round_trip_action_keys, round_trip_key_to_state_key = action_key_to_state_key_map(policy)
+    # Latest known {depth: c_i} per env slot, pushed onto each sub-env's
+    # VideoRecordingWrapper (if any) so it can burn it into the exported video
+    # and accumulate a per-episode plot - see video_recording_wrapper.py.
+    # None until that slot's first check fires; reset to None again at that
+    # slot's next episode boundary below. round_trip_ci_changed is a 1-element
+    # list used as a mutable out-param (plain closures/nonlocal don't reach
+    # into the try block cleanly here): _update_round_trip_state flips it
+    # True exactly on calls where it actually updated latest_ci, so the push
+    # to VideoRecordingWrapper below only happens when there's something new.
+    round_trip_latest_ci: list[dict[int, float] | None] = [None] * n_envs
+    round_trip_ci_changed = [False]
 
     # Initial reset; if a seed is provided, give each sub-env a distinct but
     # deterministic seed so that parallel workers don't all start from the
@@ -479,7 +517,38 @@ def _collect_rollout_episodes(
                         depths=round_trip_depths,
                         action_keys=round_trip_action_keys,
                         key_to_state_key=round_trip_key_to_state_key,
+                        latest_ci=round_trip_latest_ci,
+                        changed=round_trip_ci_changed,
                     )
+                    if round_trip_ci_changed[0]:
+                        # Push the latest-known C_i to every sub-env's
+                        # VideoRecordingWrapper, only when something actually
+                        # changed this call (most calls are a no-op between
+                        # checks). Deliberately NOT env.set_attr: gymnasium
+                        # 0.29.1 (the version the LIBERO client venv actually
+                        # pins) implements VectorEnv.set_attr as a *shallow*
+                        # `setattr(sub_env, name, value)` on whichever object
+                        # is directly in `self.envs` - MultiStepWrapper here,
+                        # not VideoRecordingWrapper one level in - so it
+                        # silently creates an unrelated attribute on the
+                        # wrong wrapper instead of reaching this one (gymnasium
+                        # >=1.0's set_attr walks the wrapper chain correctly,
+                        # but this codebase can't assume that version). A
+                        # named *method* call instead works on both: 0.29.1's
+                        # Wrapper.__getattr__ still delegates unresolved
+                        # non-underscore names to the wrapped env (its
+                        # underscore-prefix guard only blocks private-looking
+                        # names, which is exactly why this method is named
+                        # without a leading underscore), and newer gymnasium's
+                        # get_wrapper_attr-based .call() resolves it directly.
+                        # .call() invokes with the *same* args on every
+                        # sub-env, so the whole per-slot list is passed
+                        # through and each VideoRecordingWrapper picks out
+                        # its own entry via the env_idx it was constructed
+                        # with - this also sidesteps AsyncVectorEnv having no
+                        # public way to target one specific worker.
+                        env.call("set_round_trip_overlay", round_trip_latest_ci)
+                        round_trip_ci_changed[0] = False
                 except Exception:
                     # The diagnostic must never take down a real rollout.
                     logger.exception("Mechanism 2 round-trip check failed; continuing without it.")
@@ -563,6 +632,12 @@ def _collect_rollout_episodes(
                             )
                             round_trip_pending[env_idx][depth] = []
                         round_trip_history[env_idx].clear()
+                        # The overlay/plot's own per-episode series lives in
+                        # VideoRecordingWrapper and resets itself independently
+                        # in its own reset() - this just keeps the client-side
+                        # copy from showing a stale value for the first few
+                        # frames of the next episode, before its first check.
+                        round_trip_latest_ci[env_idx] = None
                     # Reset trackers for this environment.
                     current_successes[env_idx] = False
                     # only update completed_episodes if valid
@@ -823,6 +898,7 @@ def run_gr00t_sim_policy(
             video=VideoConfig(
                 video_dir=video_dir,
                 max_episode_steps=max_episode_steps,
+                round_trip_depths=round_trip_depths if enable_round_trip_check else None,
             ),
         )
 

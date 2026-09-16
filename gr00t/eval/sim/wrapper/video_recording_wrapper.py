@@ -45,10 +45,33 @@ class VideoRecordingWrapper(gym.Wrapper):
         codec="h264",
         overlay_text=True,
         record_video_keys: Sequence[str] | None = None,
+        round_trip_depths: Sequence[int] | None = None,
+        env_idx: int = 0,
         **kwargs,
     ):
         """
         When file_path is None, don't record.
+
+        round_trip_depths: when given, reserves a second caption line showing
+        each depth's latest known round-trip C_i (updated by the rollout loop
+        calling ``env.call("set_round_trip_overlay", ...)`` every macro-step a
+        value changes - see gr00t/eval/rollout_policy.py's Mechanism 2), and
+        saves a per-episode C_i-vs-step plot alongside every kept video. None
+        (the default) disables both; the line/plot are reserved/produced
+        regardless of whether any C_i has actually arrived yet for a given
+        episode, so the encoded frame shape never has to change mid-episode
+        when the first value shows up partway through.
+
+        env_idx: this sub-env's position in the vectorized batch. Needed
+        because ``set_round_trip_overlay`` receives the *whole* per-slot list
+        every call (gymnasium's ``VectorEnv.call()`` invokes every sub-env
+        with the same args - there's no per-env-different-args variant, and
+        ``VectorEnv.set_attr`` can't be used here at all: gymnasium 0.29.1,
+        which the LIBERO client venv pins, implements it as a shallow
+        ``setattr`` on whichever wrapper is directly in the vector env's own
+        list - ``MultiStepWrapper``, not this class, one level in - so it
+        silently lands on the wrong object instead of raising). Each instance
+        picks its own entry out of that list using this index.
         """
         super().__init__(env)
 
@@ -71,6 +94,8 @@ class VideoRecordingWrapper(gym.Wrapper):
         self.file_path = None
         self.overlay_text = overlay_text
         self.record_video_keys = tuple(record_video_keys) if record_video_keys is not None else None
+        self.round_trip_depths = tuple(round_trip_depths) if round_trip_depths is not None else None
+        self._env_idx = env_idx
 
         self.step_count = 0
 
@@ -81,6 +106,38 @@ class VideoRecordingWrapper(gym.Wrapper):
         # episode so that every frame in the encoded stream has the same total
         # height; the H.264 encoder rejects mid-stream shape changes.
         self.caption_height = None
+
+        # Round-trip C_i overlay/plot state (see round_trip_depths above).
+        # Written from outside via set_round_trip_overlay(), not touched
+        # directly by callers - see that method's docstring for why.
+        self._round_trip_overlay: dict[int, float] | None = None
+        self._round_trip_series: list[tuple[int, dict[int, float]]] = []
+
+    def set_round_trip_overlay(self, values_per_slot: Sequence[dict[int, float] | None]) -> None:
+        """Called by the rollout loop (``gr00t/eval/rollout_policy.py``'s
+        Mechanism 2) via ``env.call("set_round_trip_overlay", values_per_slot)``
+        every time any env slot's C_i changes - ``values_per_slot`` is the
+        *whole* vectorized batch's list, one entry per env slot, since
+        ``VectorEnv.call()`` has no per-env-different-args form. Each instance
+        picks out its own entry using the ``env_idx`` it was constructed with.
+
+        Deliberately a named method rather than a plain attribute set via
+        ``env.set_attr()``: gymnasium 0.29.1 (pinned by the LIBERO client
+        venv) implements ``VectorEnv.set_attr`` as a bare ``setattr`` on
+        whichever object is directly in the vector env's own list -
+        ``MultiStepWrapper`` here, not this class, one level further in - so
+        it silently sets an unrelated attribute on the wrong wrapper instead
+        of reaching this one or raising. A method call instead resolves
+        correctly on both gymnasium generations: 0.29.1's
+        ``Wrapper.__getattr__`` still delegates an unresolved *non-underscore*
+        name to the wrapped env (only names starting with ``_`` are
+        blocked - exactly why this method isn't named with a leading
+        underscore the way this class's other internal state is), and
+        gymnasium >=1.0's ``get_wrapper_attr``-based ``.call()`` finds it
+        directly.
+        """
+        if self._env_idx < len(values_per_slot):
+            self._round_trip_overlay = values_per_slot[self._env_idx]
 
     def close(self):
         # gym.Wrapper.close() reaps only the inner env, so without this the
@@ -194,6 +251,32 @@ class VideoRecordingWrapper(gym.Wrapper):
             self.video_process = None
             self.video_shape = None
             self.video_dtype = None
+
+    def _save_round_trip_plot(self, path: Path) -> None:
+        """One line per requested depth, C_i vs. macro-step, for the episode
+        that just ended. Matplotlib is imported lazily so it's never a hard
+        dependency for a rollout that doesn't use this feature."""
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        for depth in self.round_trip_depths:
+            steps = [s for s, values in self._round_trip_series if depth in values]
+            c_is = [values[depth] for _, values in self._round_trip_series if depth in values]
+            if c_is:
+                ax.plot(steps, c_is, marker="o", markersize=3, label=f"depth={depth}")
+        ax.set_xlabel("step")
+        ax.set_ylabel("C_i")
+        ax.set_title("Round-trip consistency per step")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        try:
+            fig.savefig(path, dpi=100)
+        finally:
+            plt.close(fig)
 
     def _get_video_frames(self, obs: dict) -> list[np.ndarray]:
         if self.record_video_keys is None:
@@ -378,6 +461,8 @@ class VideoRecordingWrapper(gym.Wrapper):
             )
             if should_keep_video:
                 os.rename(self.file_path, new_file_path)
+                if self.round_trip_depths is not None and self._round_trip_series:
+                    self._save_round_trip_plot(new_file_path.with_suffix(".png"))
             else:
                 print(
                     f"Skipping video recording for unfinished episode {previous_step_count} / {self.max_episode_steps}"
@@ -388,6 +473,10 @@ class VideoRecordingWrapper(gym.Wrapper):
         self.is_episode_finished = False
         # "intermediate_signals" contain the metrics for 5DC tasks to indicate language following
         self.intermediate_signals = {}
+        # New episode == new C_i history too, regardless of whether the video
+        # above was kept or discarded.
+        self._round_trip_overlay = None
+        self._round_trip_series = []
 
         if self.video_dir is not None:
             self.file_path = self.video_dir / f"{uuid.uuid4()}.mp4"
@@ -414,6 +503,13 @@ class VideoRecordingWrapper(gym.Wrapper):
             else:
                 frame = np.concatenate(video_frames, axis=1)
             assert frame.dtype == np.uint8
+
+            if self.round_trip_depths is not None:
+                # Recorded regardless of overlay_text, since the plot doesn't
+                # need the caption drawn - just whatever's currently known.
+                self._round_trip_series.append(
+                    (self.step_count, dict(self._round_trip_overlay or {}))
+                )
 
             if self.overlay_text:
                 # Droid dataset has "language.language_instruction"
@@ -453,7 +549,35 @@ class VideoRecordingWrapper(gym.Wrapper):
                     font_scale *= 0.9  # Scale back slightly to ensure fit
 
                 _, baseline = cv2.getTextSize(language, font, font_scale, font_thickness)
-                caption_height = text_size[1] + baseline + 2 * padding
+                language_line_height = text_size[1] + baseline + 2 * padding
+
+                # Round-trip C_i line: a short, roughly-constant-width numeric
+                # summary, so unlike the free-form language line above it uses
+                # a small *fixed* font scale rather than the dynamic
+                # width-fitting search - its height therefore never changes
+                # within an episode, so it never needs the shrink-to-fit
+                # handling the language line's height does below.
+                round_trip_text = None
+                round_trip_font_scale = 0.6
+                round_trip_thickness = 1
+                round_trip_line_height = 0
+                round_trip_text_size = None
+                if self.round_trip_depths is not None:
+                    if self._round_trip_overlay:
+                        parts = [
+                            f"d{depth}={self._round_trip_overlay[depth]:.3f}"
+                            for depth in self.round_trip_depths
+                            if depth in self._round_trip_overlay
+                        ]
+                        round_trip_text = "C_i: " + "  ".join(parts) if parts else "C_i: (pending)"
+                    else:
+                        round_trip_text = "C_i: (pending)"
+                    round_trip_text_size, rt_baseline = cv2.getTextSize(
+                        round_trip_text, font, round_trip_font_scale, round_trip_thickness
+                    )
+                    round_trip_line_height = round_trip_text_size[1] + rt_baseline + 2 * padding
+
+                caption_height = language_line_height + round_trip_line_height
                 if (frame.shape[0] + caption_height) % 2:
                     caption_height += 1
 
@@ -479,7 +603,8 @@ class VideoRecordingWrapper(gym.Wrapper):
                         text_size, baseline = cv2.getTextSize(
                             language, font, font_scale, font_thickness
                         )
-                        caption_height = text_size[1] + baseline + 2 * padding
+                        language_line_height = text_size[1] + baseline + 2 * padding
+                        caption_height = language_line_height + round_trip_line_height
                         if (frame.shape[0] + caption_height) % 2:
                             caption_height += 1
 
@@ -496,6 +621,16 @@ class VideoRecordingWrapper(gym.Wrapper):
                     font_color,
                     font_thickness,
                 )
+                if round_trip_text is not None:
+                    cv2.putText(
+                        caption,
+                        round_trip_text,
+                        (padding, language_line_height + padding + round_trip_text_size[1]),
+                        font,
+                        round_trip_font_scale,
+                        font_color,
+                        round_trip_thickness,
+                    )
                 frame = np.concatenate([frame, caption], axis=0)
 
             self._write_video_frame(frame)

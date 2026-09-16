@@ -415,6 +415,56 @@ implementations compute the same $\mathcal{C}_i$ math. `examples/robocasa/README
 client flags — a pre-existing gap from Mechanism 1 that now also applies to Mechanism 2's
 `--enable-round-trip-check` et al.
 
+**Video overlay and per-episode plot** (Mechanism 2 only — see `examples/LIBERO/README.md`'s
+"Seeing C_i on the video, and a per-episode C_i plot"): when `--enable-round-trip-check` and
+`--video-dir` are both set, `VideoRecordingWrapper` (`gr00t/eval/sim/wrapper/
+video_recording_wrapper.py`) burns each depth's latest known C_i into a second caption line
+on every kept episode's video (updated whenever a check fires, held between checks), and
+saves a `<video-name>.png` plot of C_i vs. step alongside the `.mp4`. The rollout loop pushes
+the current per-slot C_i to each sub-env via `env.call("set_round_trip_overlay", ...)` every
+macro-step, where `set_round_trip_overlay` is a plain (non-underscore) method on
+`VideoRecordingWrapper` that indexes into the per-slot list using an `env_idx` the wrapper was
+constructed with.
+
+This is deliberately *not* `env.set_attr("_round_trip_overlay", ...)`, which was the first
+approach tried and looked correct (round-tripped through `env.get_attr` cleanly in isolated
+testing) but silently never reached the video in real client runs — the caption stayed on
+"(pending)" and the plot stayed empty. Root cause: this codebase's two venvs pin different
+gymnasium versions — the top-level `.venv` has gymnasium 1.2.2, but the LIBERO client's own
+venv (`gr00t/eval/sim/LIBERO/libero_uv/.venv`, the one that actually runs `rollout_policy.py`
+as a client) pins gymnasium 0.29.1. gymnasium ≥1.0's `VectorEnv.set_attr` calls
+`env.set_wrapper_attr(name, value)`, which correctly walks the wrapper chain to find
+`VideoRecordingWrapper` even though `MultiStepWrapper` sits outermost in `self.envs[i]`. But
+gymnasium 0.29.1 has no `set_wrapper_attr` at all — its `VectorEnv.set_attr` does a *shallow*
+`setattr(self.envs[i], name, value)`, which lands on `MultiStepWrapper` and never reaches the
+inner `VideoRecordingWrapper`; it just silently creates an unrelated attribute on the wrong
+object. Isolated repros built and run under the top-level `.venv` (gymnasium 1.2.2) could not
+reproduce this, which is why it took a while to catch. `env.call(name, *args)` doesn't have
+this asymmetry — both versions resolve an unset name via delegation that walks the wrapper
+chain (`get_wrapper_attr` on ≥1.0; plain `getattr` triggering `Wrapper.__getattr__` on 0.29.1,
+which is exactly why `set_round_trip_overlay` is not underscore-prefixed — 0.29.1's
+`__getattr__` explicitly refuses to delegate names starting with `_`).
+
+Confirmed live after the fix: an `n_envs=2` (forces `AsyncVectorEnv`, not just
+`SyncVectorEnv`) smoke test against `libero_10-rtc`, run through the LIBERO client's own venv
+(gymnasium 0.29.1, the exact version that exposed the bug), produced videos with a legible,
+correctly-positioned C_i line showing real numbers (e.g. `C_i: d1=1.519 d2=1.533 d4=1.528`,
+not "(pending)"), and matching non-empty plots (~22 KB vs. ~15 KB for the earlier
+empty-of-data ones) — with the deprecation warning gymnasium 0.29.1 emits for exactly this
+kind of delegated call showing up in the log, confirming the `__getattr__` delegation path was
+actually exercised. Deliberately scoped to Mechanism 2 only — Mechanism 1's C_i is computed
+server-side and never reaches the client at all today, and wiring it through would need a
+`RoundTripMonitor`→client info channel this repo doesn't have yet (a real, but separate,
+follow-up if ever wanted). Unit tests in
+`tests/gr00t/eval/sim/wrapper/test_video_round_trip_overlay.py` (8 tests): the second caption
+line is reserved from frame 1 regardless of whether C_i has arrived yet (avoiding a mid-episode
+frame-shape change once it does), every written frame in an episode has identical shape, the
+per-episode series resets at episode boundaries, a plot is saved only alongside a kept video
+(never for a discarded one), and — the regression test for the bug above —
+`env.call("set_round_trip_overlay", ...)` through a real `gym.vector.SyncVectorEnv` wrapping
+the real `MultiStepWrapper(VideoRecordingWrapper(...))` chain with `n_envs=2` lands each
+slot's value on the `VideoRecordingWrapper` instance matching its own `env_idx`.
+
 ### LIBERO Goal closed-loop benchmark: RTC vs. baseline (real sim, real rollouts)
 
 Ran the full LIBERO Goal suite (10 tasks) closed-loop, 10 episodes/task, 5 parallel envs,

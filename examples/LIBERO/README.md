@@ -174,6 +174,39 @@ log, and a C_i-vs-outcome correlation summary — instead of one task at a time 
 hand, see [`eval_libero_10_rtc.sh`](./eval_libero_10_rtc.sh) and
 [`EVAL_LIBERO_10_RTC.md`](./EVAL_LIBERO_10_RTC.md).
 
+### Seeing C_i on the video, and a per-episode C_i plot
+
+The server-side monitor above (Mechanism 1) logs to a JSONL sidecar, not to the
+client, so it can't put anything on the recorded rollout video. For that, use
+Mechanism 2 instead — a *client-side* round-trip check, added directly to the
+`rollout_policy.py` client command (no server flags needed for this):
+
+```bash
+gr00t/eval/sim/LIBERO/libero_uv/.venv/bin/python gr00t/eval/rollout_policy.py \
+    --n-episodes 10 \
+    --policy-client-host 127.0.0.1 \
+    --policy-client-port 5555 \
+    --max-episode-steps 720 \
+    --env-name libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it \
+    --n-action-steps 8 \
+    --n-envs 5 \
+    --video-dir /tmp/sim_eval_videos \
+    --enable-round-trip-check \
+    --round-trip-check-interval 8 \
+    --round-trip-depths 1 2 4
+```
+
+With `--enable-round-trip-check` and a `--video-dir` both set, every kept
+episode's video gets a second caption line showing each depth's latest known
+C_i (updated whenever a check fires, holding its value between checks — reads
+"C_i: (pending)" until the first one lands), and a `<video-name>.png` plot of
+C_i vs. step is saved right alongside the `.mp4`, one line per depth. Same
+`--round-trip-check-interval` caveat as Mechanism 1 above (keep it equal to
+`--n-action-steps`). This is independent of Mechanism 1 — enable either, or
+both, or neither; the overlay/plot only appears when
+`--enable-round-trip-check` is set, since that's the mechanism whose C_i the
+client already computes directly, with no extra server-side plumbing needed.
+
 # Full task list
 
 ## Libero 10 (Long)
