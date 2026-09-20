@@ -63,7 +63,17 @@ class _FakePolicy(BasePolicy):
     Backward calls (direction=1) reconstruct every env's "one call ago" state
     as (current x - 1) in a *single batched* call - records the batch size
     seen on each backward call so tests can confirm Mechanism 2 never issues
-    one call per env slot the way Mechanism 1 does."""
+    one call per env slot the way Mechanism 1 does.
+
+    When options["return_latent"] is set (Mechanism 2 always sets it once
+    enable_round_trip_check is on - see _round_trip_options), both forward and
+    backward calls also report a latent: tile(x, HIDDEN_SIZE) for the call's
+    own x (forward) or its reconstruction of "x one call ago" (backward) -
+    same value x drives both action_c_i and latent_c_i, so exact-value tests
+    can assert on both from one simple construction.
+    """
+
+    HIDDEN_SIZE = 2
 
     def __init__(self):
         super().__init__(strict=False)
@@ -81,13 +91,22 @@ class _FakePolicy(BasePolicy):
 
     def _get_action(self, observation, options=None):
         batch = observation["state.x"].shape[0]
+        want_latent = bool(options and options.get("return_latent"))
+        cur_x = observation["state.x"][:, -1, 0]
         if options and options.get("direction") == 1:
             self.backward_batch_sizes.append(batch)
-            cur_x = observation["state.x"][:, -1, 0]
-            recon_x = (cur_x - 1.0).reshape(batch, 1, 1).astype(np.float32)
-            return {"action.x": recon_x}, {}
+            recon_x = cur_x - 1.0
+            info = {}
+            if want_latent:
+                info["latent_pred"] = np.tile(recon_x[:, None], (1, self.HIDDEN_SIZE)).astype(
+                    np.float32
+                )
+            return {"action.x": recon_x.reshape(batch, 1, 1).astype(np.float32)}, info
         self.forward_calls += 1
-        return {"action.x": np.zeros((batch, 1, 1), dtype=np.float32)}, {}
+        info = {}
+        if want_latent:
+            info["latent_pred"] = np.tile(cur_x[:, None], (1, self.HIDDEN_SIZE)).astype(np.float32)
+        return {"action.x": np.zeros((batch, 1, 1), dtype=np.float32)}, info
 
     def reset(self, options=None):
         return {}
@@ -103,6 +122,16 @@ class _FakeEnv:
         self.episode_length = episode_length
         self.step_count = 0
         self.x = np.zeros(n_envs, dtype=np.float32)
+        # Records every env.call(...) the rollout loop makes (e.g. pushing the
+        # video overlay) - without this, gymnasium's real VectorEnv.call would
+        # be exercised in production but this fake silently has no .call() at
+        # all, and _collect_rollout_episodes's try/except would swallow the
+        # resulting AttributeError without any test noticing.
+        self.calls: list[tuple] = []
+
+    def call(self, name, *args, **kwargs):
+        self.calls.append((name, args, kwargs))
+        return ()
 
     def reset(self, seed=None):
         self.step_count = 0
@@ -141,7 +170,7 @@ class TestDisabledByDefault:
         )
 
         assert policy.backward_batch_sizes == []
-        assert not any(k.startswith("round_trip_c_i_depth") for k in episode_infos)
+        assert not any("c_i_depth" in k for k in episode_infos)
 
 
 class TestBatchedBackwardCall:
@@ -171,12 +200,13 @@ class TestExactValuesAndEpisodeBoundary:
         """One env, two 4-step episodes back to back (episode_length=4,
         check_interval=2, depths=(1, 2)). Depth=1 reconstructs exactly (C_i=0)
         in both episodes; depth=2 is off by exactly 1 (C_i=1.0) whenever a
-        valid target exists. Both episodes landing on the same exact values
-        proves the second episode's checks never spuriously used episode 1's
-        cached state after the autoreset boundary - if they had, the huge x
-        discontinuity (episode 1 ends at x=4, episode 2 starts at x=0) would
-        show up as a wildly different, inexact C_i instead of these clean
-        values.
+        valid target exists - true for both action_c_i and latent_c_i, since
+        _FakePolicy derives both from the same x-based construction (see its
+        docstring). Both episodes landing on the same exact values proves the
+        second episode's checks never spuriously used episode 1's cached state
+        after the autoreset boundary - if they had, the huge x discontinuity
+        (episode 1 ends at x=4, episode 2 starts at x=0) would show up as a
+        wildly different, inexact C_i instead of these clean values.
         """
         policy = _FakePolicy()
         env = _FakeEnv(n_envs=1, episode_length=4)
@@ -193,8 +223,15 @@ class TestExactValuesAndEpisodeBoundary:
         )
 
         assert len(successes) == 2
-        assert episode_infos["round_trip_c_i_depth1"] == pytest.approx([0.0, 0.0], abs=1e-6)
-        assert episode_infos["round_trip_c_i_depth2"] == pytest.approx([1.0, 1.0], abs=1e-6)
+        assert episode_infos["round_trip_action_c_i_depth1"] == pytest.approx([0.0, 0.0], abs=1e-6)
+        assert episode_infos["round_trip_action_c_i_depth2"] == pytest.approx([1.0, 1.0], abs=1e-6)
+        assert episode_infos["round_trip_latent_c_i_depth1"] == pytest.approx([0.0, 0.0], abs=1e-6)
+        assert episode_infos["round_trip_latent_c_i_depth2"] == pytest.approx([1.0, 1.0], abs=1e-6)
+        # The video-overlay push (env.call("set_round_trip_overlay", ...))
+        # fired with both C_i dicts, not just the action one.
+        assert env.calls
+        assert env.calls[0][0] == "set_round_trip_overlay"
+        assert len(env.calls[0][1]) == 2
 
     def test_episode_shorter_than_check_interval_records_nan(self):
         """An episode that ends before a single check ever fires must still
@@ -215,5 +252,7 @@ class TestExactValuesAndEpisodeBoundary:
         )
 
         assert policy.backward_batch_sizes == []
-        assert len(episode_infos["round_trip_c_i_depth1"]) == 3
-        assert all(np.isnan(v) for v in episode_infos["round_trip_c_i_depth1"])
+        assert len(episode_infos["round_trip_action_c_i_depth1"]) == 3
+        assert all(np.isnan(v) for v in episode_infos["round_trip_action_c_i_depth1"])
+        assert len(episode_infos["round_trip_latent_c_i_depth1"]) == 3
+        assert all(np.isnan(v) for v in episode_infos["round_trip_latent_c_i_depth1"])

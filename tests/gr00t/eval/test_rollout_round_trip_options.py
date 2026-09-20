@@ -80,15 +80,20 @@ def test_round_trip_episode_ids_bump_independently_per_slot():
     _collect_rollout_episodes(env, policy, n_episodes=2, n_envs=2, seed=None, env_name="my_task")
 
     assert len(policy.seen_options) == 2
-    # Before any step: both slots at episode 0.
+    # Before any step: both slots at episode 0. return_latent is False here -
+    # enable_round_trip_check defaults to False in this test, and the latent
+    # is only ever requested when round-trip checking is actually on (see
+    # _round_trip_options).
     assert policy.seen_options[0] == {
         "round_trip_task": "my_task",
         "round_trip_episode_ids": ["0:0", "1:0"],
+        "return_latent": False,
     }
     # After step 1 (env 0's episode ended): only slot 0 bumped.
     assert policy.seen_options[1] == {
         "round_trip_task": "my_task",
         "round_trip_episode_ids": ["0:1", "1:0"],
+        "return_latent": False,
     }
 
 

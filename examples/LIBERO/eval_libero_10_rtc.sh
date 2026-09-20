@@ -258,8 +258,11 @@ PY
 # ---- C_i-vs-outcome correlation -----------------------------------------------
 # Joins each task's per-episode outcome (from its result JSON's
 # episode_infos["round_trip_episode_id"], index-aligned with "successes")
-# against the round-trip JSONL log's episode_id/task/c_i fields, and reports
-# mean C_i for failed vs. succeeded episodes - both per-task and overall.
+# against the round-trip JSONL log's episode_id/task/action_c_i fields, and
+# reports mean action_c_i for failed vs. succeeded episodes - both per-task
+# and overall. Reports action_c_i only, not latent_c_i (see
+# round_trip_monitor.py's "Two C_i metrics" section) - a real, separate
+# follow-up if a latent_c_i-vs-outcome correlation is ever wanted too.
 if [ -f "$RTC_LOG_PATH" ]; then
   python3 - "$RESULTS_DIR" "$RTC_LOG_PATH" "$CORRELATION_JSON" "${TASKS[@]}" <<'PY'
 import json
@@ -276,7 +279,7 @@ with open(jsonl_path) as f:
         if not line:
             continue
         row = json.loads(line)
-        rows_by_key.setdefault((row["task"], row["episode_id"]), []).append(row["c_i"])
+        rows_by_key.setdefault((row["task"], row["episode_id"]), []).append(row["action_c_i"])
 
 per_task = []
 all_fail, all_succ = [], []

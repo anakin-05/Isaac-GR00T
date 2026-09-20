@@ -148,7 +148,13 @@ gr00t/eval/sim/LIBERO/libero_uv/.venv/bin/python gr00t/eval/rollout_policy.py \
 For a checkpoint fine-tuned with `--enable-direction-conditioning` (see the
 [round-trip-consistency integration handoff](../../HANDOFF_ROUND_TRIP_CONSISTENCY.md)), add
 these flags to the server command above to also log a round-trip-consistency diagnostic
-($\mathcal{C}_i$) alongside the rollout, with **no changes to the client command**:
+alongside the rollout, with **no changes to the client command**. Two $\mathcal{C}_i$ metrics
+are logged together, both from the same backward-direction query: `action_c_i` (MSE between
+the true past state and the *decoded* backward-reconstruction of it — the original metric) and
+`latent_c_i` (MSE between the DiT's own last-timestep hidden state — the representation
+immediately *before* decoding — from the real forward call and the backward call's equivalent).
+See [`round_trip_monitor.py`](../../gr00t/policy/round_trip_monitor.py)'s "Two C_i metrics"
+section for the full math.
 
 ```bash
 uv run python gr00t/eval/run_gr00t_server.py \
@@ -197,10 +203,13 @@ gr00t/eval/sim/LIBERO/libero_uv/.venv/bin/python gr00t/eval/rollout_policy.py \
 ```
 
 With `--enable-round-trip-check` and a `--video-dir` both set, every kept
-episode's video gets a second caption line showing each depth's latest known
-C_i (updated whenever a check fires, holding its value between checks — reads
-"C_i: (pending)" until the first one lands), and a `<video-name>.png` plot of
-C_i vs. step is saved right alongside the `.mp4`, one line per depth. Same
+episode's video gets two extra caption lines — `C_i(action): d1=... d2=...`
+and `C_i(latent): d1=... d2=...` — showing each depth's latest known value of
+both metrics (updated whenever a check fires, holding its value between
+checks — reads "(pending)" until the first one lands), and a
+`<video-name>.png` plot is saved right alongside the `.mp4` with two stacked
+subplots (action_c_i on top, latent_c_i on the bottom — different scales, so
+not one shared axes), one line per depth in each. Same
 `--round-trip-check-interval` caveat as Mechanism 1 above (keep it equal to
 `--n-action-steps`). This is independent of Mechanism 1 — enable either, or
 both, or neither; the overlay/plot only appears when

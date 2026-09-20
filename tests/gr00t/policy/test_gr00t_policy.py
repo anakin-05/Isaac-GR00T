@@ -170,6 +170,48 @@ class TestGr00tPolicyGetAction:
         assert isinstance(info, dict)
 
 
+class TestGr00tPolicyReturnLatent:
+    """options["return_latent"] - see Gr00tPolicy._get_action's docstring and
+    round_trip_monitor.py's "Two C_i metrics" section for what this feeds."""
+
+    def test_latent_pred_absent_by_default(self, policy):
+        # The `policy` fixture's mocked model.get_action doesn't return
+        # "latent_pred" at all (matches a model built before this feature
+        # existed) - absent options, info must simply have nothing to show.
+        obs = _make_observation()
+        _, info = policy.get_action(obs)
+        assert "latent_pred" not in info
+
+    def test_latent_pred_absent_when_not_requested_even_if_model_supports_it(self, policy):
+        policy.model.get_action = MagicMock(
+            return_value=BatchFeature(
+                data={"action_pred": torch.randn(1, 16, 7), "latent_pred": torch.randn(1, 32)}
+            )
+        )
+        obs = _make_observation()
+        _, info = policy.get_action(obs)  # no options at all
+        assert "latent_pred" not in info
+
+    def test_latent_pred_present_when_requested_and_available(self, policy):
+        policy.model.get_action = MagicMock(
+            return_value=BatchFeature(
+                data={"action_pred": torch.randn(1, 16, 7), "latent_pred": torch.randn(1, 32)}
+            )
+        )
+        obs = _make_observation()
+        _, info = policy.get_action(obs, options={"return_latent": True})
+        assert isinstance(info["latent_pred"], np.ndarray)
+        assert info["latent_pred"].shape == (1, 32)
+
+    def test_latent_pred_absent_when_requested_but_model_does_not_support_it(self, policy):
+        # The default mock's get_action doesn't return "latent_pred" -
+        # options["return_latent"]=True alone can't manufacture data the
+        # model didn't produce.
+        obs = _make_observation()
+        _, info = policy.get_action(obs, options={"return_latent": True})
+        assert "latent_pred" not in info
+
+
 class _NumpyLanguageSimPolicy:
     def __init__(self):
         self.modality_configs = {

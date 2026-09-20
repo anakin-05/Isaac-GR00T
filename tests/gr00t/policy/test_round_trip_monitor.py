@@ -71,11 +71,21 @@ class _StubPolicy(BasePolicy):
         action_dims: dict[str, int],
         state_dims: dict[str, int] | None = None,
         reconstruct=None,
+        latent_reconstruct=None,
+        hidden_size: int = 3,
     ):
         super().__init__(strict=False)
         self.action_dims = action_dims
         self.state_dims = state_dims or action_dims
         self.reconstruct = reconstruct  # fn(single_obs) -> {key: np.ndarray (D,)} or None
+        # fn(single_obs) -> np.ndarray (hidden_size,) or None. When set, forward
+        # calls also report a latent (state.x, the only key these tests ever
+        # give it, tiled to hidden_size) so a test can control the *backward*
+        # reconstruction independently and check latent_c_i exactly - same
+        # opt-in-by-callback pattern as `reconstruct` above, just for
+        # info["latent_pred"] instead of the decoded action.
+        self.latent_reconstruct = latent_reconstruct
+        self.hidden_size = hidden_size
         self.forward_calls = 0
         self.backward_calls = 0
         self.reset_calls = 0
@@ -99,13 +109,21 @@ class _StubPolicy(BasePolicy):
             for key, dim in self.action_dims.items():
                 val = recon.get(key, np.zeros(dim, dtype=np.float32))
                 action[f"action.{key}"] = np.asarray(val, dtype=np.float32).reshape(1, 1, dim)
-            return action, {}
+            info = {}
+            if options.get("return_latent") and self.latent_reconstruct is not None:
+                latent = np.asarray(self.latent_reconstruct(observation), dtype=np.float32)
+                info["latent_pred"] = latent.reshape(1, self.hidden_size)
+            return action, info
         self.forward_calls += 1
         action = {
             f"action.{key}": np.zeros((batch, 1, dim), dtype=np.float32)
             for key, dim in self.action_dims.items()
         }
-        return action, {}
+        info = {}
+        if options and options.get("return_latent") and self.latent_reconstruct is not None:
+            x = next(v for k, v in observation.items() if k.startswith("state."))[:, -1, 0]
+            info["latent_pred"] = np.tile(x[:, None], (1, self.hidden_size)).astype(np.float32)
+        return action, info
 
     def reset(self, options=None):
         self.reset_calls += 1
@@ -146,7 +164,8 @@ class TestIntervalAndDepthBookkeeping:
                 "env_slot",
                 "call_index",
                 "depth",
-                "c_i",
+                "action_c_i",
+                "latent_c_i",
                 "episode_id",
                 "task",
                 "per_key",
@@ -159,7 +178,9 @@ class TestIntervalAndDepthBookkeeping:
             # "gripper" has a dimension-mismatched state/action pair (2 vs 1) -
             # excluded from per_key, same as state_action_processor.apply_reversed.
             assert set(row["per_key"].keys()) == {"x"}
-            assert np.isfinite(row["c_i"])
+            assert np.isfinite(row["action_c_i"])
+            # This stub never sets latent_reconstruct - no latent to compare.
+            assert row["latent_c_i"] is None
 
     def test_multiple_env_slots_tracked_independently(self, tmp_path):
         log_path = tmp_path / "rtc.jsonl"
@@ -206,7 +227,83 @@ class TestExactRecoveryDepth1:
         # 3 rows from call_index 1, 2, 3.
         assert len(rows) == 3
         for row in rows:
-            assert row["c_i"] == pytest.approx(0.0, abs=1e-6)
+            assert row["action_c_i"] == pytest.approx(0.0, abs=1e-6)
+
+
+class TestLatentCi:
+    """latent_c_i - see round_trip_monitor.py's "Two C_i metrics" section.
+    latent_reconstruct mirrors reconstruct's role above, but for
+    info["latent_pred"] instead of the decoded action."""
+
+    def test_perfect_depth1_latent_reconstruction_gives_zero_latent_c_i(self, tmp_path):
+        log_path = tmp_path / "rtc.jsonl"
+        policy = _StubPolicy(
+            action_dims={"x": 1},
+            reconstruct=lambda obs: {"x": obs["state.x"][0, -1] - 1.0},
+            # Forward calls cache tile(x, hidden_size) as this call's latent (see
+            # _StubPolicy._get_action); reconstructing "x one call ago" here,
+            # tiled the same way, should exactly match it at depth=1.
+            latent_reconstruct=lambda obs: np.full(3, obs["state.x"][0, -1] - 1.0),
+            hidden_size=3,
+        )
+        monitor = RoundTripMonitor(
+            policy,
+            round_trip_check_interval=1,
+            round_trip_depths=[1],
+            round_trip_log_path=str(log_path),
+        )
+        for i in range(4):
+            monitor.get_action(_obs({"x": float(i)}))
+
+        rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert len(rows) == 3
+        for row in rows:
+            assert row["action_c_i"] == pytest.approx(0.0, abs=1e-6)
+            assert row["latent_c_i"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_off_by_one_latent_reconstruction_gives_nonzero_latent_c_i(self, tmp_path):
+        log_path = tmp_path / "rtc.jsonl"
+        policy = _StubPolicy(
+            action_dims={"x": 1},
+            reconstruct=lambda obs: {"x": obs["state.x"][0, -1] - 1.0},
+            # Deliberately wrong by a constant offset of 2 in latent space only -
+            # action_c_i (still exact) and latent_c_i (now 4.0 = 2**2 per
+            # component) must be independent numbers, not the same value twice.
+            latent_reconstruct=lambda obs: np.full(3, obs["state.x"][0, -1] - 1.0 + 2.0),
+            hidden_size=3,
+        )
+        monitor = RoundTripMonitor(
+            policy,
+            round_trip_check_interval=1,
+            round_trip_depths=[1],
+            round_trip_log_path=str(log_path),
+        )
+        for i in range(2):
+            monitor.get_action(_obs({"x": float(i)}))
+
+        rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["action_c_i"] == pytest.approx(0.0, abs=1e-6)
+        assert rows[0]["latent_c_i"] == pytest.approx(4.0, abs=1e-6)
+
+    def test_latent_c_i_is_none_when_policy_does_not_support_return_latent(self, tmp_path):
+        log_path = tmp_path / "rtc.jsonl"
+        policy = _StubPolicy(
+            action_dims={"x": 1}, reconstruct=lambda obs: {"x": obs["state.x"][0, -1] - 1.0}
+        )
+        monitor = RoundTripMonitor(
+            policy,
+            round_trip_check_interval=1,
+            round_trip_depths=[1],
+            round_trip_log_path=str(log_path),
+        )
+        for i in range(2):
+            monitor.get_action(_obs({"x": float(i)}))
+
+        rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["action_c_i"] == pytest.approx(0.0, abs=1e-6)
+        assert rows[0]["latent_c_i"] is None
 
 
 class TestEpisodeIdAndTask:
@@ -251,7 +348,9 @@ class TestEpisodeIdAndTask:
                 "some_other_key": 1,
             },
         )
-        assert seen_options == [{"some_other_key": 1}]
+        # return_latent is injected by RoundTripMonitor itself on every forwarded
+        # call (see _get_action) - not something the caller asked for.
+        assert seen_options == [{"some_other_key": 1, "return_latent": True}]
 
     def test_episode_id_change_clears_stale_history(self, tmp_path):
         """A new episode starting in the same env slot (gymnasium's inline

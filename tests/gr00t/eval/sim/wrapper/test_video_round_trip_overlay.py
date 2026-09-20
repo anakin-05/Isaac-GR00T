@@ -15,12 +15,13 @@
 
 """
 Tests for VideoRecordingWrapper's round_trip_depths overlay/plot feature (see
-gr00t/eval/rollout_policy.py's Mechanism 2, which pushes the latest known C_i
-onto the wrapper every macro-step via
-``env.call("set_round_trip_overlay", ...)``). Mocked ffmpeg (writes are
-stubbed out, matching the pattern already used in
-test_video_recording_wrapper.py), CPU-safe, no real video/plot I/O required
-for most assertions.
+gr00t/eval/rollout_policy.py's Mechanism 2, which pushes the latest known
+action_c_i and latent_c_i onto the wrapper every macro-step via
+``env.call("set_round_trip_overlay", action_values_per_slot, latent_values_per_slot)``
+- see round_trip_monitor.py's "Two C_i metrics" section for what the two
+metrics are). Mocked ffmpeg (writes are stubbed out, matching the pattern
+already used in test_video_recording_wrapper.py), CPU-safe, no real
+video/plot I/O required for most assertions.
 
 TestCallReachesTheCorrectSlotVideoWrapper is the one class here that goes
 through a real gym.vector.SyncVectorEnv + MultiStepWrapper(VideoRecordingWrapper(...))
@@ -84,7 +85,7 @@ class TestOverlayDisabledIsUnchanged:
         assert wrapper._round_trip_series == []
 
 
-class TestSecondLineReservedUpfront:
+class TestRoundTripLinesReservedUpfront:
     def test_caption_taller_than_baseline_before_any_ci_arrives(self, monkeypatch):
         monkeypatch.setattr(VideoRecordingWrapper, "_write_video_frame", lambda self, frame: None)
 
@@ -92,7 +93,7 @@ class TestSecondLineReservedUpfront:
         baseline.step(None)
 
         with_ci = _make_wrapper(round_trip_depths=(1, 2))
-        with_ci.step(None)  # no C_i set yet - still shows "(pending)"
+        with_ci.step(None)  # no C_i set yet - both lines still show "(pending)"
 
         assert with_ci.caption_height > baseline.caption_height
 
@@ -108,15 +109,17 @@ class TestFrameShapeStaysConstant:
         wrapper = _make_wrapper(round_trip_depths=(1, 2))
 
         wrapper.step(None)  # frame 1: no C_i yet ("(pending)")
-        wrapper._round_trip_overlay = {1: 1.234567, 2: 2.345678}
-        wrapper.step(None)  # frame 2: C_i now present
-        wrapper._round_trip_overlay = {1: 1.2, 2: 2.3}
+        wrapper._round_trip_overlay_action = {1: 1.234567, 2: 2.345678}
+        wrapper._round_trip_overlay_latent = {1: 0.001, 2: 0.002}
+        wrapper.step(None)  # frame 2: both C_i now present
+        wrapper._round_trip_overlay_action = {1: 1.2, 2: 2.3}
+        wrapper._round_trip_overlay_latent = {1: 0.003, 2: 0.004}
         wrapper.step(None)  # frame 3: different C_i values
 
         assert len(written_shapes) == 3
         # H.264 rejects a mid-stream shape change - every frame this wrapper
         # ever hands to ffmpeg must be identical, regardless of whether/what
-        # C_i text was drawn into the reserved second line.
+        # C_i text was drawn into the two reserved lines.
         assert len(set(written_shapes)) == 1
 
 
@@ -126,29 +129,33 @@ class TestSeriesAccumulation:
         wrapper = _make_wrapper(round_trip_depths=(1, 2))
 
         wrapper.step(None)
-        wrapper._round_trip_overlay = {1: 1.5}
+        wrapper._round_trip_overlay_action = {1: 1.5}
+        wrapper._round_trip_overlay_latent = {1: 0.5}
         wrapper.step(None)
-        wrapper._round_trip_overlay = {1: 1.6, 2: 1.7}
+        wrapper._round_trip_overlay_action = {1: 1.6, 2: 1.7}
+        wrapper._round_trip_overlay_latent = {1: 0.6, 2: 0.7}
         wrapper.step(None)
 
-        assert [values for _, values in wrapper._round_trip_series] == [
-            {},
-            {1: 1.5},
-            {1: 1.6, 2: 1.7},
+        assert [(action, latent) for _, action, latent in wrapper._round_trip_series] == [
+            ({}, {}),
+            ({1: 1.5}, {1: 0.5}),
+            ({1: 1.6, 2: 1.7}, {1: 0.6, 2: 0.7}),
         ]
 
     def test_series_resets_on_new_episode(self, monkeypatch):
         monkeypatch.setattr(VideoRecordingWrapper, "_write_video_frame", lambda self, frame: None)
         wrapper = _make_wrapper(round_trip_depths=(1,), max_episode_steps=1)
 
-        wrapper._round_trip_overlay = {1: 1.5}
+        wrapper._round_trip_overlay_action = {1: 1.5}
+        wrapper._round_trip_overlay_latent = {1: 0.5}
         wrapper.step(None)
         assert wrapper._round_trip_series != []
 
         wrapper.reset()
 
         assert wrapper._round_trip_series == []
-        assert wrapper._round_trip_overlay is None
+        assert wrapper._round_trip_overlay_action is None
+        assert wrapper._round_trip_overlay_latent is None
 
 
 class TestPlotExport:
@@ -163,9 +170,11 @@ class TestPlotExport:
         monkeypatch.setattr(VideoRecordingWrapper, "_write_video_frame", _fake_write_frame)
 
         wrapper = _make_wrapper(round_trip_depths=(1, 2), video_dir=tmp_path, max_episode_steps=2)
-        wrapper._round_trip_overlay = {1: 1.5, 2: 1.6}
+        wrapper._round_trip_overlay_action = {1: 1.5, 2: 1.6}
+        wrapper._round_trip_overlay_latent = {1: 0.15, 2: 0.16}
         wrapper.step(None)
-        wrapper._round_trip_overlay = {1: 1.55, 2: 1.62}
+        wrapper._round_trip_overlay_action = {1: 1.55, 2: 1.62}
+        wrapper._round_trip_overlay_latent = {1: 0.155, 2: 0.162}
         wrapper.step(None)  # step_count now >= max_episode_steps -> kept on next reset()
 
         wrapper.reset()
@@ -187,7 +196,8 @@ class TestPlotExport:
         # max_episode_steps very high, episode never "finishes" or succeeds -
         # should_keep_video is False, matching an interrupted/unfinished run.
         wrapper = _make_wrapper(round_trip_depths=(1,), video_dir=tmp_path, max_episode_steps=1000)
-        wrapper._round_trip_overlay = {1: 1.5}
+        wrapper._round_trip_overlay_action = {1: 1.5}
+        wrapper._round_trip_overlay_latent = {1: 0.5}
         wrapper.step(None)
 
         wrapper.reset()
@@ -221,9 +231,10 @@ class _DummyStepEnv(_DummyLanguageEnv):
 
 class TestCallReachesTheCorrectSlotVideoWrapper:
     """Regression test for a bug where the rollout loop pushed the latest C_i
-    via ``env.set_attr("_round_trip_overlay", ...)``, which appeared to work
-    (get_attr read back whatever set_attr had just written) but the video
-    caption/plot stayed stuck on "(pending)" forever in production.
+    via ``env.set_attr("_round_trip_overlay", ...)`` (back when there was
+    only one C_i metric), which appeared to work (get_attr read back whatever
+    set_attr had just written) but the video caption/plot stayed stuck on
+    "(pending)" forever in production.
 
     Root cause: MultiStepWrapper sits directly in a VectorEnv's ``self.envs``
     (it's the outermost wrapper), with VideoRecordingWrapper nested one level
@@ -246,10 +257,11 @@ class TestCallReachesTheCorrectSlotVideoWrapper:
     method below is deliberately not underscore-prefixed - 0.29.1's
     ``__getattr__`` refuses to delegate names starting with "_"). This test
     exercises the exact call the rollout loop makes,
-    ``env.call("set_round_trip_overlay", values_per_slot)``, through a real
-    two-level wrapper chain with n_envs=2, confirming each slot's value lands
-    on the VideoRecordingWrapper instance matching its own env_idx - not
-    just that *some* attribute got set somewhere.
+    ``env.call("set_round_trip_overlay", action_values_per_slot, latent_values_per_slot)``,
+    through a real two-level wrapper chain with n_envs=2, confirming each
+    slot's action *and* latent values land on the VideoRecordingWrapper
+    instance matching its own env_idx - not just that *some* attribute got
+    set somewhere.
     """
 
     def _make_env_fn(self, env_idx):
@@ -269,12 +281,15 @@ class TestCallReachesTheCorrectSlotVideoWrapper:
     def test_call_reaches_the_correct_slot(self):
         vec_env = gym.vector.SyncVectorEnv([self._make_env_fn(0), self._make_env_fn(1)])
         try:
-            values_per_slot = [{1: 0.1, 2: 0.2}, {1: 0.9, 2: 0.8}]
+            action_values_per_slot = [{1: 0.1, 2: 0.2}, {1: 0.9, 2: 0.8}]
+            latent_values_per_slot = [{1: 0.01, 2: 0.02}, {1: 0.09, 2: 0.08}]
 
-            vec_env.call("set_round_trip_overlay", values_per_slot)
+            vec_env.call("set_round_trip_overlay", action_values_per_slot, latent_values_per_slot)
 
             video_wrappers = [sub_env.env for sub_env in vec_env.envs]
-            assert video_wrappers[0]._round_trip_overlay == {1: 0.1, 2: 0.2}
-            assert video_wrappers[1]._round_trip_overlay == {1: 0.9, 2: 0.8}
+            assert video_wrappers[0]._round_trip_overlay_action == {1: 0.1, 2: 0.2}
+            assert video_wrappers[1]._round_trip_overlay_action == {1: 0.9, 2: 0.8}
+            assert video_wrappers[0]._round_trip_overlay_latent == {1: 0.01, 2: 0.02}
+            assert video_wrappers[1]._round_trip_overlay_latent == {1: 0.09, 2: 0.08}
         finally:
             vec_env.close()

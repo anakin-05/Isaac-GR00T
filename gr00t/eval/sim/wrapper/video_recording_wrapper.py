@@ -52,15 +52,20 @@ class VideoRecordingWrapper(gym.Wrapper):
         """
         When file_path is None, don't record.
 
-        round_trip_depths: when given, reserves a second caption line showing
-        each depth's latest known round-trip C_i (updated by the rollout loop
-        calling ``env.call("set_round_trip_overlay", ...)`` every macro-step a
-        value changes - see gr00t/eval/rollout_policy.py's Mechanism 2), and
-        saves a per-episode C_i-vs-step plot alongside every kept video. None
-        (the default) disables both; the line/plot are reserved/produced
-        regardless of whether any C_i has actually arrived yet for a given
-        episode, so the encoded frame shape never has to change mid-episode
-        when the first value shows up partway through.
+        round_trip_depths: when given, reserves two extra caption lines
+        showing each depth's latest known round-trip C_i - one for
+        action_c_i (decoded-action-space MSE), one for latent_c_i
+        (pre-decoder DiT-hidden-state MSE; see
+        gr00t/policy/round_trip_monitor.py's "Two C_i metrics" section for
+        both metrics' definitions) - updated by the rollout loop calling
+        ``env.call("set_round_trip_overlay", ...)`` every macro-step either
+        value changes (see gr00t/eval/rollout_policy.py's Mechanism 2), and
+        saves a per-episode C_i-vs-step plot (one subplot per metric)
+        alongside every kept video. None (the default) disables both; the
+        lines/plot are reserved/produced regardless of whether any C_i has
+        actually arrived yet for a given episode, so the encoded frame shape
+        never has to change mid-episode when the first value shows up
+        partway through.
 
         env_idx: this sub-env's position in the vectorized batch. Needed
         because ``set_round_trip_overlay`` receives the *whole* per-slot list
@@ -109,17 +114,28 @@ class VideoRecordingWrapper(gym.Wrapper):
 
         # Round-trip C_i overlay/plot state (see round_trip_depths above).
         # Written from outside via set_round_trip_overlay(), not touched
-        # directly by callers - see that method's docstring for why.
-        self._round_trip_overlay: dict[int, float] | None = None
-        self._round_trip_series: list[tuple[int, dict[int, float]]] = []
+        # directly by callers - see that method's docstring for why. Action
+        # and latent C_i are tracked separately throughout - two independent
+        # metrics, never combined into one number.
+        self._round_trip_overlay_action: dict[int, float] | None = None
+        self._round_trip_overlay_latent: dict[int, float] | None = None
+        self._round_trip_series: list[tuple[int, dict[int, float], dict[int, float]]] = []
 
-    def set_round_trip_overlay(self, values_per_slot: Sequence[dict[int, float] | None]) -> None:
+    def set_round_trip_overlay(
+        self,
+        action_values_per_slot: Sequence[dict[int, float] | None],
+        latent_values_per_slot: Sequence[dict[int, float] | None],
+    ) -> None:
         """Called by the rollout loop (``gr00t/eval/rollout_policy.py``'s
-        Mechanism 2) via ``env.call("set_round_trip_overlay", values_per_slot)``
-        every time any env slot's C_i changes - ``values_per_slot`` is the
-        *whole* vectorized batch's list, one entry per env slot, since
-        ``VectorEnv.call()`` has no per-env-different-args form. Each instance
-        picks out its own entry using the ``env_idx`` it was constructed with.
+        Mechanism 2) via
+        ``env.call("set_round_trip_overlay", action_values_per_slot, latent_values_per_slot)``
+        every time any env slot's action_c_i or latent_c_i changes - each
+        argument is the *whole* vectorized batch's list, one entry per env
+        slot, since ``VectorEnv.call()`` has no per-env-different-args form.
+        Each instance picks out its own entry from each using the ``env_idx``
+        it was constructed with. Both are passed in the same call (not two
+        separate ``.call()``s) so a slot's action/latent overlay values can
+        never observably disagree about which macro-step they're from.
 
         Deliberately a named method rather than a plain attribute set via
         ``env.set_attr()``: gymnasium 0.29.1 (pinned by the LIBERO client
@@ -136,8 +152,10 @@ class VideoRecordingWrapper(gym.Wrapper):
         gymnasium >=1.0's ``get_wrapper_attr``-based ``.call()`` finds it
         directly.
         """
-        if self._env_idx < len(values_per_slot):
-            self._round_trip_overlay = values_per_slot[self._env_idx]
+        if self._env_idx < len(action_values_per_slot):
+            self._round_trip_overlay_action = action_values_per_slot[self._env_idx]
+        if self._env_idx < len(latent_values_per_slot):
+            self._round_trip_overlay_latent = latent_values_per_slot[self._env_idx]
 
     def close(self):
         # gym.Wrapper.close() reaps only the inner env, so without this the
@@ -254,24 +272,36 @@ class VideoRecordingWrapper(gym.Wrapper):
 
     def _save_round_trip_plot(self, path: Path) -> None:
         """One line per requested depth, C_i vs. macro-step, for the episode
-        that just ended. Matplotlib is imported lazily so it's never a hard
+        that just ended - two stacked subplots, action_c_i on top and
+        latent_c_i on the bottom, sharing the step axis. Separate subplots
+        rather than one shared axes because the two metrics live on
+        unrelated scales (one is decoded-action-space MSE, the other raw
+        hidden-state MSE - see round_trip_monitor.py's "Two C_i metrics"
+        section), so overlaying them on one y-axis would make at least one
+        unreadable. Matplotlib is imported lazily so it's never a hard
         dependency for a rollout that doesn't use this feature."""
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        for depth in self.round_trip_depths:
-            steps = [s for s, values in self._round_trip_series if depth in values]
-            c_is = [values[depth] for _, values in self._round_trip_series if depth in values]
-            if c_is:
-                ax.plot(steps, c_is, marker="o", markersize=3, label=f"depth={depth}")
-        ax.set_xlabel("step")
-        ax.set_ylabel("C_i")
-        ax.set_title("Round-trip consistency per step")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        fig, (ax_action, ax_latent) = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+        for ax, series_idx, label in (
+            (ax_action, 1, "C_i (action)"),
+            (ax_latent, 2, "C_i (latent)"),
+        ):
+            for depth in self.round_trip_depths:
+                steps = [s[0] for s in self._round_trip_series if depth in s[series_idx]]
+                c_is = [
+                    s[series_idx][depth] for s in self._round_trip_series if depth in s[series_idx]
+                ]
+                if c_is:
+                    ax.plot(steps, c_is, marker="o", markersize=3, label=f"depth={depth}")
+            ax.set_ylabel(label)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        ax_latent.set_xlabel("step")
+        ax_action.set_title("Round-trip consistency per step")
         fig.tight_layout()
         try:
             fig.savefig(path, dpi=100)
@@ -475,7 +505,8 @@ class VideoRecordingWrapper(gym.Wrapper):
         self.intermediate_signals = {}
         # New episode == new C_i history too, regardless of whether the video
         # above was kept or discarded.
-        self._round_trip_overlay = None
+        self._round_trip_overlay_action = None
+        self._round_trip_overlay_latent = None
         self._round_trip_series = []
 
         if self.video_dir is not None:
@@ -508,7 +539,11 @@ class VideoRecordingWrapper(gym.Wrapper):
                 # Recorded regardless of overlay_text, since the plot doesn't
                 # need the caption drawn - just whatever's currently known.
                 self._round_trip_series.append(
-                    (self.step_count, dict(self._round_trip_overlay or {}))
+                    (
+                        self.step_count,
+                        dict(self._round_trip_overlay_action or {}),
+                        dict(self._round_trip_overlay_latent or {}),
+                    )
                 )
 
             if self.overlay_text:
@@ -551,33 +586,45 @@ class VideoRecordingWrapper(gym.Wrapper):
                 _, baseline = cv2.getTextSize(language, font, font_scale, font_thickness)
                 language_line_height = text_size[1] + baseline + 2 * padding
 
-                # Round-trip C_i line: a short, roughly-constant-width numeric
-                # summary, so unlike the free-form language line above it uses
-                # a small *fixed* font scale rather than the dynamic
-                # width-fitting search - its height therefore never changes
-                # within an episode, so it never needs the shrink-to-fit
-                # handling the language line's height does below.
-                round_trip_text = None
+                # Round-trip C_i lines: short, roughly-constant-width numeric
+                # summaries, so unlike the free-form language line above they
+                # use a small *fixed* font scale rather than the dynamic
+                # width-fitting search - their height therefore never changes
+                # within an episode, so they never need the shrink-to-fit
+                # handling the language line's height does below. Two
+                # separate lines (action_c_i, latent_c_i - see
+                # round_trip_monitor.py's "Two C_i metrics" section), not one
+                # combined line, since they're independent metrics.
                 round_trip_font_scale = 0.6
                 round_trip_thickness = 1
-                round_trip_line_height = 0
-                round_trip_text_size = None
+                round_trip_lines: list[tuple[str, tuple[int, int], int]] = []
+                round_trip_lines_height = 0
                 if self.round_trip_depths is not None:
-                    if self._round_trip_overlay:
-                        parts = [
-                            f"d{depth}={self._round_trip_overlay[depth]:.3f}"
-                            for depth in self.round_trip_depths
-                            if depth in self._round_trip_overlay
-                        ]
-                        round_trip_text = "C_i: " + "  ".join(parts) if parts else "C_i: (pending)"
-                    else:
-                        round_trip_text = "C_i: (pending)"
-                    round_trip_text_size, rt_baseline = cv2.getTextSize(
-                        round_trip_text, font, round_trip_font_scale, round_trip_thickness
-                    )
-                    round_trip_line_height = round_trip_text_size[1] + rt_baseline + 2 * padding
 
-                caption_height = language_line_height + round_trip_line_height
+                    def _round_trip_text(label: str, values: dict[int, float] | None) -> str:
+                        if values:
+                            parts = [
+                                f"d{depth}={values[depth]:.3f}"
+                                for depth in self.round_trip_depths
+                                if depth in values
+                            ]
+                            if parts:
+                                return f"{label}: " + "  ".join(parts)
+                        return f"{label}: (pending)"
+
+                    for label, values in (
+                        ("C_i(action)", self._round_trip_overlay_action),
+                        ("C_i(latent)", self._round_trip_overlay_latent),
+                    ):
+                        text = _round_trip_text(label, values)
+                        text_size_rt, baseline_rt = cv2.getTextSize(
+                            text, font, round_trip_font_scale, round_trip_thickness
+                        )
+                        line_height = text_size_rt[1] + baseline_rt + 2 * padding
+                        round_trip_lines.append((text, text_size_rt, line_height))
+                        round_trip_lines_height += line_height
+
+                caption_height = language_line_height + round_trip_lines_height
                 if (frame.shape[0] + caption_height) % 2:
                     caption_height += 1
 
@@ -604,7 +651,7 @@ class VideoRecordingWrapper(gym.Wrapper):
                             language, font, font_scale, font_thickness
                         )
                         language_line_height = text_size[1] + baseline + 2 * padding
-                        caption_height = language_line_height + round_trip_line_height
+                        caption_height = language_line_height + round_trip_lines_height
                         if (frame.shape[0] + caption_height) % 2:
                             caption_height += 1
 
@@ -621,16 +668,18 @@ class VideoRecordingWrapper(gym.Wrapper):
                     font_color,
                     font_thickness,
                 )
-                if round_trip_text is not None:
+                y_offset = language_line_height
+                for text, text_size_rt, line_height in round_trip_lines:
                     cv2.putText(
                         caption,
-                        round_trip_text,
-                        (padding, language_line_height + padding + round_trip_text_size[1]),
+                        text,
+                        (padding, y_offset + padding + text_size_rt[1]),
                         font,
                         round_trip_font_scale,
                         font_color,
                         round_trip_thickness,
                     )
+                    y_offset += line_height
                 frame = np.concatenate([frame, caption], axis=0)
 
             self._write_video_frame(frame)

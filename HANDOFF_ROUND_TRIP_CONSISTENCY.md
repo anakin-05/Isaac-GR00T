@@ -370,7 +370,7 @@ slot the way `RoundTripMonitor` has to (it can only see one request at a time, w
 guarantee of how many envs share it; this loop already knows its own batch is
 `n_envs` wide) — computes each env's $\mathcal{C}_i$ against its own cached true state
 from `depth` calls ago, and appends the *mean* of whatever was computed during that
-episode into `episode_infos[f"round_trip_c_i_depth{{depth}}"]` when that env's episode
+episode into `episode_infos[f"round_trip_action_c_i_depth{{depth}}"]` when that env's episode
 ends (`NaN` if the episode ended before any check fired) — the same per-episode
 aggregation sink `"task_progress"`/`"q_score"` already use, so results surface in
 whatever summary a benchmark already produces, no new reporting plumbing needed.
@@ -403,7 +403,9 @@ own JSONL) and client with `--enable-round-trip-check` (Mechanism 2, populating
 `episode_infos`) both enabled at once, same `--round-trip-check-interval 8
 --round-trip-depths 1 2 4`. Grouped Mechanism 1's JSONL rows by `(episode_id, depth)` and
 compared each group's mean $\mathcal{C}_i$ against Mechanism 2's corresponding
-`episode_infos["round_trip_c_i_depth{depth}"]` entry for the same episode: **27 of 27
+`episode_infos["round_trip_action_c_i_depth{depth}"]` entry for the same episode (the field was
+just `round_trip_c_i_depth{depth}` at the time of this run, before the action_c_i/latent_c_i
+rename below): **27 of 27
 (episode, depth) pairs matched closely — max absolute difference 0.028, max relative
 difference 1.9%, no order-of-magnitude or sign discrepancies anywhere.** The residual
 sub-2% differences are consistent with ordinary batch-size-dependent floating-point
@@ -464,6 +466,67 @@ per-episode series resets at episode boundaries, a plot is saved only alongside 
 `env.call("set_round_trip_overlay", ...)` through a real `gym.vector.SyncVectorEnv` wrapping
 the real `MultiStepWrapper(VideoRecordingWrapper(...))` chain with `n_envs=2` lands each
 slot's value on the `VideoRecordingWrapper` instance matching its own `env_idx`.
+
+**Second C_i metric: latent_c_i, alongside a rename of the original metric to action_c_i.**
+Everything above computed one C_i in *decoded action/state space*: MSE between the true past
+state (read straight from the environment) and the backward call's decoded action-chunk
+reconstruction of it. That metric is now called `action_c_i` (renamed from bare `c_i`/`C_i`
+everywhere — JSONL field, `episode_infos` key, video caption, plot). A second metric,
+`latent_c_i`, round-trips the same forward/backward asymmetry one step earlier in the
+pipeline: MSE between the DiT's own last-timestep hidden state (`Gr00tN1d7ActionHead
+.get_action_with_features`'s `model_output[:, -1, :]`, the tensor immediately *before*
+`self.action_decoder` — free to expose since it's already computed for the real action, not an
+extra forward pass) from the real forward call `depth` calls ago, and the backward call's
+equivalent hidden state now. A checkpoint can be self-consistent in one space and not the
+other — the decoder is itself a learned, lossy map — so the two are complementary
+diagnostics, not redundant ones; see `round_trip_monitor.py`'s "Two C_i metrics" section for
+the full writeup.
+
+Plumbing: `Gr00tN1d7ActionHead.get_action_with_features` always returns `"latent_pred"` in its
+`BatchFeature` (free). `Gr00tPolicy._get_action` only copies it into the returned `info` dict
+when the caller passes `options["return_latent"]=True` — opt-in so an ordinary control-loop
+call pays no extra CPU/GPU-sync or (for a networked `PolicyClient`) serialization cost.
+`Gr00tSimPolicyWrapper` and `PolicyServer`/`PolicyClient` needed **zero changes** — `info`
+already flows through every layer untouched (confirmed by reading `Gr00tSimPolicyWrapper
+._get_action`'s `return {...}, info` and `PolicyServer`'s `register_endpoint("get_action",
+self.policy.get_action)`, then verified by the passing tests below), including across the ZMQ
+client/server boundary via the existing `msgpack_numpy`-based `MsgSerializer`, which already
+handles arbitrary non-object-dtype ndarrays generically (not just the hardcoded `"action"`
+key) — exactly the same mechanism that already carries the decoded action across that
+boundary. Both mechanisms now request `return_latent` unconditionally whenever round-trip
+checking itself is on (no separate flag), caching the forward-leg latent per env slot the same
+way `history` already caches the true state (`RoundTripMonitor._SlotState.latent_history`;
+Mechanism 2's `round_trip_latent_history` in `_collect_rollout_episodes`), and compute
+`latent_c_i` the same MSE way as `action_c_i` but without the per-action-key breakdown (one
+hidden-state tensor, not several named components). `latent_c_i` is `None` (not `0.0`/omitted)
+whenever unavailable — e.g. a test stub or an older policy that doesn't support
+`return_latent` — so the row/dict schema stays fixed either way, not sometimes-present.
+
+Video overlay/plot updated to match: a third caption line (`C_i(latent): ...`, same
+"(pending)"-until-first-check convention as before) alongside the renamed `C_i(action): ...`
+line, and the per-episode plot is now two stacked subplots (action_c_i on top, latent_c_i on
+the bottom) rather than one — the two metrics live on unrelated scales, so one shared y-axis
+would make at least one unreadable. `set_round_trip_overlay` now takes two per-slot list
+arguments (action, latent) in one `env.call(...)`, not two separate calls, so a slot's two
+overlay values can never observably disagree about which macro-step they're from.
+
+Tests: `tests/gr00t/model/test_action_head.py::TestActionHeadGetAction
+::test_get_action_returns_latent_pred` (real, non-mocked action head — confirms
+`"latent_pred"` has shape `(batch, hidden_size)`, no grad, finite); `tests/gr00t/policy
+/test_gr00t_policy.py::TestGr00tPolicyReturnLatent` (4 tests — absent by default, absent when
+not requested even if the model supports it, present when both requested and supported,
+absent when requested but the model doesn't support it); `tests/gr00t/policy
+/test_round_trip_monitor.py::TestLatentCi` (3 tests — perfect reconstruction gives
+`latent_c_i≈0` independently of `action_c_i`, an off-by-a-constant reconstruction gives an
+exact nonzero value distinct from `action_c_i`, and `None` when the wrapped policy doesn't
+support `return_latent`); `tests/gr00t/eval/test_rollout_round_trip_mechanism2.py` extended
+the same way for Mechanism 2, plus a new assertion that the video-overlay push
+(`env.call("set_round_trip_overlay", ...)`) actually fires with both per-slot dicts, not just
+the action one (the fake env there previously had no `.call()` at all, so this path was
+silently unexercised by any test before now). `tests/gr00t/eval/sim/wrapper
+/test_video_round_trip_overlay.py` updated throughout for the renamed/added wrapper state.
+Full CPU suite re-run after all of the above with no new failures beyond the two known
+pre-existing environmental ones.
 
 ### LIBERO Goal closed-loop benchmark: RTC vs. baseline (real sim, real rollouts)
 

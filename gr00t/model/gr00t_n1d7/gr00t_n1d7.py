@@ -507,6 +507,15 @@ class Gr00tN1d7ActionHead(nn.Module):
                 "action_pred": actions,
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
+                # Last-timestep DiT hidden state from the final denoising step,
+                # immediately before self.action_decoder - i.e. the same position
+                # action_decoder(...)[:, -1] is decoded from, one layer earlier.
+                # Free to compute (model_output already exists from the loop
+                # above); round-trip-consistency's "latent C_i" round-trips this
+                # instead of the decoded action (see round_trip_monitor.py /
+                # rollout_policy.py). `model_output` is the last loop iteration's
+                # value here since Python retains the loop variable after exit.
+                "latent_pred": model_output[:, -1, :],
             }
         )
 
@@ -536,7 +545,9 @@ class Gr00tN1d7ActionHead(nn.Module):
         if drop_vision is not None and not torch.is_tensor(drop_vision):
             batch_size = backbone_output["backbone_features"].shape[0]
             device = backbone_output["backbone_features"].device
-            drop_vision = torch.full((batch_size,), bool(drop_vision), dtype=torch.bool, device=device)
+            drop_vision = torch.full(
+                (batch_size,), bool(drop_vision), dtype=torch.bool, device=device
+            )
         features = self._encode_features(backbone_output, action_input, drop_vision=drop_vision)
         return self.get_action_with_features(
             backbone_features=features.backbone_features,

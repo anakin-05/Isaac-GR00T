@@ -152,6 +152,21 @@ class TestActionHeadGetAction:
         )
         assert out["action_pred"].shape[0] == 1
 
+    def test_get_action_returns_latent_pred(self, action_head):
+        """ "latent_pred" (round-trip consistency's "latent C_i" - see
+        round_trip_monitor.py's "Two C_i metrics" section) is the last
+        denoising step's last-timestep DiT hidden state, immediately before
+        self.action_decoder - free to return since get_action_with_features
+        already computes it for the real action_pred."""
+        head, config = action_head
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        out = head.get_action(_make_backbone_output(config), action_input)
+        assert "latent_pred" in out
+        assert out["latent_pred"].shape == (2, config.hidden_size)
+        assert not out["latent_pred"].requires_grad
+        assert torch.isfinite(out["latent_pred"]).all()
+
 
 class TestActionHeadEncodeFeatures:
     """Test feature encoding helper."""

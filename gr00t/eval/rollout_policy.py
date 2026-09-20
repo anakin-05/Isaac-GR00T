@@ -300,49 +300,78 @@ def _update_round_trip_state(
     *,
     policy: BasePolicy,
     observations: dict[str, Any],
+    forward_info: dict[str, Any],
     call_index: int,
     n_envs: int,
     history: list[deque[tuple[int, dict[str, np.ndarray]]]],
+    latent_history: list[deque[tuple[int, np.ndarray]]],
     pending: list[dict[int, list[float]]],
+    pending_latent: list[dict[int, list[float]]],
     max_depth: int,
     check_interval: int,
     depths: tuple[int, ...],
     action_keys: list[str],
     key_to_state_key: dict[str, str],
     latest_ci: list[dict[int, float] | None] | None = None,
+    latest_latent_ci: list[dict[int, float] | None] | None = None,
     changed: list[bool] | None = None,
 ) -> None:
     """Mechanism 2's per-macro-step hook (see ``_collect_rollout_episodes``'s
     docstring): cache this call's true state for every env slot, then every
     ``check_interval`` calls issue *one* batched backward-direction query and
-    accumulate each env's C_i (per requested depth) into ``pending`` for that
-    env's in-progress episode. Mirrors ``RoundTripMonitor._check_slot``'s math
-    (Mechanism 1) but with a single batched call instead of one per env slot,
-    since this loop's observation is already naturally batched.
+    accumulate each env's action_c_i and latent_c_i (per requested depth) into
+    ``pending``/``pending_latent`` for that env's in-progress episode. Mirrors
+    ``RoundTripMonitor._check_slot``'s math (Mechanism 1) but with a single
+    batched call instead of one per env slot, since this loop's observation is
+    already naturally batched.
+
+    Two C_i metrics, cached and compared the same way (see round_trip_monitor.py's
+    "Two C_i metrics" section for the full rationale):
+      - action_c_i: MSE between the true past state and the *decoded* backward
+        reconstruction of it (the original metric).
+      - latent_c_i: MSE between the DiT's own last-timestep hidden state
+        (``info["latent_pred"]``, only present when the caller requested
+        ``options["return_latent"]``) from the real forward call ``depth``
+        calls ago, and the backward call's equivalent hidden state now. Skipped
+        (nothing appended to ``pending_latent``, ``latest_latent_ci`` untouched)
+        whenever a slot/depth has no cached latent - e.g. the wrapped policy
+        doesn't support ``return_latent``, or this env's macro-step didn't have
+        one cached for some other reason.
+
+    ``forward_info`` is the ``info`` dict returned by *this call's own* regular
+    (direction=0) ``policy.get_action`` - the caller already makes that call for
+    the real control action every macro-step, so reading its latent back out
+    here is free (no extra model call), unlike the backward leg below.
 
     ``changed``, when given, has its single element set ``True`` exactly on
-    calls where ``latest_ci`` was actually updated - lets the caller skip
-    pushing an unchanged value to the video overlay on the (large majority
-    of) calls between checks.
+    calls where ``latest_ci``/``latest_latent_ci`` was actually updated - lets
+    the caller skip pushing an unchanged value to the video overlay on the
+    (large majority of) calls between checks.
 
-    ``latest_ci``, when given, is updated in place with the freshest
-    ``{depth: c_i}`` computed this call for each slot (a new dict replaces the
-    old one rather than mutating it, so a caller that handed a per-slot dict
-    off to something else - e.g. the video overlay below - never sees it
-    change under it) - purely for the video-overlay/plot feature, no effect
-    on ``pending``'s per-episode aggregation.
+    ``latest_ci``/``latest_latent_ci``, when given, are updated in place with
+    the freshest ``{depth: c_i}`` computed this call for each slot (a new dict
+    replaces the old one rather than mutating it, so a caller that handed a
+    per-slot dict off to something else - e.g. the video overlay below - never
+    sees it change under it) - purely for the video-overlay/plot feature, no
+    effect on ``pending``/``pending_latent``'s per-episode aggregation.
     """
     state = _modality_dict(observations, "state")
+    latent_pred = forward_info.get("latent_pred")  # (n_envs, hidden_size) or None
     for slot in range(n_envs):
         true_state = {key: _last_timestep(np.asarray(arr[slot])) for key, arr in state.items()}
         history[slot].append((call_index, true_state))
         while len(history[slot]) > max_depth + 1:
             history[slot].popleft()
+        if latent_pred is not None:
+            latent_history[slot].append((call_index, np.asarray(latent_pred[slot])))
+            while len(latent_history[slot]) > max_depth + 1:
+                latent_history[slot].popleft()
 
     if (call_index + 1) % check_interval != 0:
         return
 
     histories_by_index = [dict(h) for h in history]
+    latent_histories_by_index = [dict(h) for h in latent_history]
     has_target = any(
         (call_index - depth) in histories_by_index[slot]
         for slot in range(n_envs)
@@ -353,8 +382,8 @@ def _update_round_trip_state(
         # e.g. still early in the rollout - so skip issuing it at all.
         return
 
-    backward_action, _ = policy.get_action(
-        observations, options={"direction": 1, "drop_vision": True}
+    backward_action, backward_info = policy.get_action(
+        observations, options={"direction": 1, "drop_vision": True, "return_latent": True}
     )
     backward_state = _modality_dict(backward_action, "action")
     reconstructed = {
@@ -362,6 +391,7 @@ def _update_round_trip_state(
         for key in action_keys
         if key in backward_state
     }
+    backward_latent = backward_info.get("latent_pred")  # (n_envs, hidden_size) or None
 
     for slot in range(n_envs):
         for depth in depths:
@@ -387,6 +417,20 @@ def _update_round_trip_state(
                     latest_ci[slot] = {**(latest_ci[slot] or {}), depth: c_i}
                     if changed is not None:
                         changed[0] = True
+
+            cached_latent = latent_histories_by_index[slot].get(call_index - depth)
+            if cached_latent is not None and backward_latent is not None:
+                est_latent = np.asarray(backward_latent[slot])
+                if cached_latent.shape == est_latent.shape:
+                    latent_c_i = float(np.mean((cached_latent - est_latent) ** 2))
+                    pending_latent[slot][depth].append(latent_c_i)
+                    if latest_latent_ci is not None:
+                        latest_latent_ci[slot] = {
+                            **(latest_latent_ci[slot] or {}),
+                            depth: latent_c_i,
+                        }
+                        if changed is not None:
+                            changed[0] = True
 
 
 def _collect_rollout_episodes(
@@ -418,14 +462,19 @@ def _collect_rollout_episodes(
     macro-steps it issues one additional *batched* backward-direction
     ``policy.get_action`` call (one call for the whole vectorized batch, not
     one per env slot - this loop already has a naturally batched observation),
-    computes each env's C_i against its own cached true state from ``depth``
-    calls ago, and appends the *mean* of whatever C_i values were computed
-    during that episode into ``episode_infos[f"round_trip_c_i_depth{depth}"]``
-    when that env's episode ends (``float("nan")`` if none were - e.g. an
-    episode shorter than one check interval) - the same per-episode
-    aggregation sink ``"task_progress"``/``"q_score"`` already use, so results
-    surface in whatever summary a benchmark already produces, with no new
-    reporting plumbing. Because this function owns episode boundaries
+    computes each env's action_c_i (decoded-action-space MSE) and latent_c_i
+    (pre-decoder DiT-hidden-state MSE - see round_trip_monitor.py's "Two C_i
+    metrics" section for both metrics' full definitions) against its own
+    cached true state/latent from ``depth`` calls ago, and appends the *mean*
+    of whatever values were computed during that episode into
+    ``episode_infos[f"round_trip_action_c_i_depth{depth}"]`` and
+    ``episode_infos[f"round_trip_latent_c_i_depth{depth}"]`` when that env's
+    episode ends (``float("nan")`` if none were - e.g. an episode shorter than
+    one check interval, or latent_c_i when the policy doesn't support
+    ``options["return_latent"]``) - the same per-episode aggregation sink
+    ``"task_progress"``/``"q_score"`` already use, so results surface in
+    whatever summary a benchmark already produces, with no new reporting
+    plumbing. Because this function owns episode boundaries
     directly (unlike Mechanism 1, which must infer them from the
     ``round_trip_episode_ids`` this same function supplies via ``options``),
     a round-trip window can never span an episode boundary without needing
@@ -460,6 +509,12 @@ def _collect_rollout_episodes(
             "round_trip_episode_ids": [
                 f"{i}:{c}" for i, c in enumerate(round_trip_episode_counters)
             ],
+            # Only requested when round-trip checking is actually on - an
+            # ordinary rollout pays zero extra CPU/GPU-sync or (for a networked
+            # PolicyClient) serialization cost for the latent otherwise. See
+            # Gr00tPolicy._get_action / round_trip_monitor.py's "Two C_i
+            # metrics" section for what this buys: latent_c_i's forward leg.
+            "return_latent": enable_round_trip_check,
         }
 
     # Mechanism 2 bookkeeping (see docstring above) - every piece here is a
@@ -468,7 +523,13 @@ def _collect_rollout_episodes(
     round_trip_history: list[deque[tuple[int, dict[str, np.ndarray]]]] = [
         deque() for _ in range(n_envs)
     ]
+    round_trip_latent_history: list[deque[tuple[int, np.ndarray]]] = [
+        deque() for _ in range(n_envs)
+    ]
     round_trip_pending: list[dict[int, list[float]]] = [
+        {depth: [] for depth in round_trip_depths} for _ in range(n_envs)
+    ]
+    round_trip_pending_latent: list[dict[int, list[float]]] = [
         {depth: [] for depth in round_trip_depths} for _ in range(n_envs)
     ]
     round_trip_action_keys: list[str] = []
@@ -482,9 +543,11 @@ def _collect_rollout_episodes(
     # slot's next episode boundary below. round_trip_ci_changed is a 1-element
     # list used as a mutable out-param (plain closures/nonlocal don't reach
     # into the try block cleanly here): _update_round_trip_state flips it
-    # True exactly on calls where it actually updated latest_ci, so the push
-    # to VideoRecordingWrapper below only happens when there's something new.
+    # True exactly on calls where it actually updated either latest_ci dict, so
+    # the push to VideoRecordingWrapper below only happens when there's
+    # something new.
     round_trip_latest_ci: list[dict[int, float] | None] = [None] * n_envs
+    round_trip_latest_latent_ci: list[dict[int, float] | None] = [None] * n_envs
     round_trip_ci_changed = [False]
 
     # Initial reset; if a seed is provided, give each sub-env a distinct but
@@ -501,23 +564,27 @@ def _collect_rollout_episodes(
     pbar = tqdm(total=n_episodes, desc="Episodes")
     try:
         while completed_episodes < n_episodes:
-            actions, _ = policy.get_action(observations, options=_round_trip_options())
+            actions, forward_info = policy.get_action(observations, options=_round_trip_options())
 
             if enable_round_trip_check:
                 try:
                     _update_round_trip_state(
                         policy=policy,
                         observations=observations,
+                        forward_info=forward_info,
                         call_index=call_index,
                         n_envs=n_envs,
                         history=round_trip_history,
+                        latent_history=round_trip_latent_history,
                         pending=round_trip_pending,
+                        pending_latent=round_trip_pending_latent,
                         max_depth=round_trip_max_depth,
                         check_interval=round_trip_check_interval,
                         depths=round_trip_depths,
                         action_keys=round_trip_action_keys,
                         key_to_state_key=round_trip_key_to_state_key,
                         latest_ci=round_trip_latest_ci,
+                        latest_latent_ci=round_trip_latest_latent_ci,
                         changed=round_trip_ci_changed,
                     )
                     if round_trip_ci_changed[0]:
@@ -546,8 +613,16 @@ def _collect_rollout_episodes(
                         # through and each VideoRecordingWrapper picks out
                         # its own entry via the env_idx it was constructed
                         # with - this also sidesteps AsyncVectorEnv having no
-                        # public way to target one specific worker.
-                        env.call("set_round_trip_overlay", round_trip_latest_ci)
+                        # public way to target one specific worker. Both C_i
+                        # dicts go in the same call (not two separate .call()s)
+                        # so a slot's action/latent overlay values never
+                        # observably disagree about which macro-step they're
+                        # from.
+                        env.call(
+                            "set_round_trip_overlay",
+                            round_trip_latest_ci,
+                            round_trip_latest_latent_ci,
+                        )
                         round_trip_ci_changed[0] = False
                 except Exception:
                     # The diagnostic must never take down a real rollout.
@@ -620,24 +695,33 @@ def _collect_rollout_episodes(
                         f"{env_idx}:{round_trip_episode_counters[env_idx]}"
                     )
                     if enable_round_trip_check:
-                        # Mechanism 2: flush this episode's accumulated C_i values
-                        # (mean per depth, NaN if the episode ended before any
-                        # check fired) and clear this slot's history so the next
-                        # episode in this slot starts with a clean ring buffer -
-                        # no window can span the boundary that way.
+                        # Mechanism 2: flush this episode's accumulated C_i values -
+                        # both metrics (mean per depth, NaN if the episode ended
+                        # before any check fired, or before latent_c_i had a
+                        # value to average - see _update_round_trip_state) - and
+                        # clear this slot's history so the next episode in this
+                        # slot starts with a clean ring buffer - no window can
+                        # span the boundary that way.
                         for depth in round_trip_depths:
                             values = round_trip_pending[env_idx][depth]
-                            episode_infos[f"round_trip_c_i_depth{depth}"].append(
+                            episode_infos[f"round_trip_action_c_i_depth{depth}"].append(
                                 float(np.mean(values)) if values else float("nan")
                             )
                             round_trip_pending[env_idx][depth] = []
+                            latent_values = round_trip_pending_latent[env_idx][depth]
+                            episode_infos[f"round_trip_latent_c_i_depth{depth}"].append(
+                                float(np.mean(latent_values)) if latent_values else float("nan")
+                            )
+                            round_trip_pending_latent[env_idx][depth] = []
                         round_trip_history[env_idx].clear()
+                        round_trip_latent_history[env_idx].clear()
                         # The overlay/plot's own per-episode series lives in
                         # VideoRecordingWrapper and resets itself independently
                         # in its own reset() - this just keeps the client-side
                         # copy from showing a stale value for the first few
                         # frames of the next episode, before its first check.
                         round_trip_latest_ci[env_idx] = None
+                        round_trip_latest_latent_ci[env_idx] = None
                     # Reset trackers for this environment.
                     current_successes[env_idx] = False
                     # only update completed_episodes if valid

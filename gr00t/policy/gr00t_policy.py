@@ -393,10 +393,21 @@ class Gr00tPolicy(BasePolicy):
             observation: Batched observation dictionary
             options: Optional parameters forwarded to the model's get_action
                 (e.g. RTC inpainting params, or round-trip consistency's
-                "direction"/"drop_vision" - see Gr00tN1d7ActionHead.get_action_with_features)
+                "direction"/"drop_vision" - see Gr00tN1d7ActionHead.get_action_with_features).
+                ``options["return_latent"]``, when truthy, additionally
+                populates the returned ``info`` dict with ``"latent_pred"``
+                (see below) - opt-in so an ordinary control-loop call (which
+                never sets it) pays no extra CPU/GPU-sync or, for a networked
+                PolicyClient, serialization cost.
 
         Returns:
-            Tuple of (actions_dict, info_dict)
+            Tuple of (actions_dict, info_dict). ``info["latent_pred"]``, only
+            present when ``options["return_latent"]`` was set, is the
+            ``(B, hidden_size)`` last-timestep DiT hidden state the action was
+            decoded from (see Gr00tN1d7ActionHead.get_action_with_features's
+            "latent_pred") - round-trip consistency's "latent C_i" round-trips
+            this instead of the decoded action (see round_trip_monitor.py /
+            rollout_policy.py).
         """
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
@@ -431,7 +442,11 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+
+        info: dict[str, Any] = {}
+        if options is not None and options.get("return_latent") and "latent_pred" in model_pred:
+            info["latent_pred"] = model_pred["latent_pred"].float().cpu().numpy()
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

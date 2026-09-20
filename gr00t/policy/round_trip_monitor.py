@@ -35,6 +35,28 @@ directly in gr00t_policy.py - no server/RPC changes needed). Enable it by wrappi
 constructed policy before handing it to ``PolicyServer`` (see
 ``gr00t/eval/run_gr00t_server.py``'s ``--enable-round-trip-monitor`` flag).
 
+Two C_i metrics, logged together
+---------------------------------
+Every JSONL row carries both:
+
+- ``"action_c_i"``: MSE between the true past state (read straight from the observation, no
+  model call needed) and the *decoded* backward-direction action-chunk reconstruction of it -
+  the original metric, computed exactly as before this field was named just ``"c_i"``.
+- ``"latent_c_i"``: MSE between the DiT's own last-timestep hidden state (``model_output``,
+  ``Gr00tN1d7ActionHead.get_action_with_features``'s ``"latent_pred"`` - the tensor
+  immediately *before* ``self.action_decoder``) from the real forward call ``depth`` calls
+  ago, and the backward call's equivalent hidden state now. Free on the forward leg (every
+  real control-loop call already computes this tensor; caching it costs only a small
+  CPU/GPU-sync copy) and costs nothing extra on the backward leg (same call action_c_i
+  already makes, just also asking for ``options["return_latent"]``). ``None`` (not
+  ``0.0``/omitted, so the row schema stays fixed) when the wrapped policy doesn't support
+  ``return_latent`` (e.g. a test stub).
+
+Both round-trip the same forward/backward asymmetry, just at different points in the
+pipeline - action_c_i after decoding to physical units, latent_c_i before it. A checkpoint
+can be self-consistent in one space and not the other (the decoder is itself a learned,
+lossy map), so the two are complementary diagnostics, not redundant ones.
+
 Per-episode and per-task identity (both optional, both additive)
 ------------------------------------------------------------------
 By default this monitor identifies an env purely by its *positional* index in the batched
@@ -216,6 +238,10 @@ class _SlotState:
     call_index: int = 0
     episode_id: str | None = None
     history: deque[tuple[int, dict[str, np.ndarray]]] = field(default_factory=deque)
+    # Forward-leg cache for "latent C_i" (see module docstring's "Two C_i
+    # metrics" section) - the (hidden_size,) last-timestep DiT hidden state
+    # from each real forward call, keyed by call_index exactly like `history`.
+    latent_history: deque[tuple[int, np.ndarray]] = field(default_factory=deque)
 
 
 class RoundTripMonitor(PolicyWrapper):
@@ -264,10 +290,17 @@ class RoundTripMonitor(PolicyWrapper):
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         forwarded_options, episode_ids, task = _extract_round_trip_options(options)
-        action, info = self.policy.get_action(observation, forwarded_options)
+        # Always ask the wrapped policy for its latent alongside the real
+        # action - "latent C_i"'s forward leg piggybacks on this call (see
+        # module docstring), so caching it here costs only a small CPU/GPU-sync
+        # copy of a tensor the model already computed, not an extra model call.
+        # A policy that doesn't understand "return_latent" just ignores it,
+        # same as any other unrecognized options key.
+        latent_options = {**(forwarded_options or {}), "return_latent": True}
+        action, info = self.policy.get_action(observation, latent_options)
 
         try:
-            self._maybe_check_round_trip(observation, episode_ids, task)
+            self._maybe_check_round_trip(observation, info, episode_ids, task)
         except Exception:
             # The diagnostic must never take down real closed-loop control.
             logger.exception("RoundTripMonitor: round-trip check failed; continuing without it.")
@@ -275,11 +308,16 @@ class RoundTripMonitor(PolicyWrapper):
         return action, info
 
     def _maybe_check_round_trip(
-        self, observation: dict[str, Any], episode_ids: list[str] | None, task: str | None
+        self,
+        observation: dict[str, Any],
+        info: dict[str, Any],
+        episode_ids: list[str] | None,
+        task: str | None,
     ) -> None:
         state = _modality_dict(observation, "state")
         batch_size = _batch_size(observation)
         action_keys, key_to_state_key = action_key_to_state_key_map(self.policy)
+        latent_pred = info.get("latent_pred")  # (B, hidden_size) or None
 
         for slot in range(batch_size):
             slot_state = self._slots.setdefault(slot, _SlotState())
@@ -296,6 +334,7 @@ class RoundTripMonitor(PolicyWrapper):
                 # see the module docstring's "Per-episode and per-task identity"
                 # section for why positional slot index alone can't catch this.
                 slot_state.history.clear()
+                slot_state.latent_history.clear()
             if new_episode_id is not None:
                 slot_state.episode_id = new_episode_id
 
@@ -305,8 +344,14 @@ class RoundTripMonitor(PolicyWrapper):
             while len(slot_state.history) > self._max_depth + 1:
                 slot_state.history.popleft()
 
+            if latent_pred is not None:
+                slot_state.latent_history.append((call_index, np.asarray(latent_pred[slot])))
+                while len(slot_state.latent_history) > self._max_depth + 1:
+                    slot_state.latent_history.popleft()
+
             if (call_index + 1) % self.round_trip_check_interval == 0:
                 history_by_index = dict(slot_state.history)
+                latent_history_by_index = dict(slot_state.latent_history)
                 has_target = any(
                     (call_index - depth) in history_by_index for depth in self.round_trip_depths
                 )
@@ -321,6 +366,7 @@ class RoundTripMonitor(PolicyWrapper):
                         action_keys,
                         key_to_state_key,
                         history_by_index,
+                        latent_history_by_index,
                         slot_state.episode_id,
                         task,
                     )
@@ -335,14 +381,16 @@ class RoundTripMonitor(PolicyWrapper):
         action_keys: list[str],
         key_to_state_key: dict[str, str],
         history_by_index: dict[int, dict[str, np.ndarray]],
+        latent_history_by_index: dict[int, np.ndarray],
         episode_id: str | None,
         task: str | None,
     ) -> None:
         single_obs = _slice_observation(observation, slot)
-        backward_action, _ = self.policy.get_action(
-            single_obs, options={"direction": 1, "drop_vision": True}
+        backward_action, backward_info = self.policy.get_action(
+            single_obs, options={"direction": 1, "drop_vision": True, "return_latent": True}
         )
         backward_state = _modality_dict(backward_action, "action")
+        backward_latent = backward_info.get("latent_pred")  # (1, hidden_size) or None
 
         rows = []
         for depth in self.round_trip_depths:
@@ -364,12 +412,26 @@ class RoundTripMonitor(PolicyWrapper):
                 per_key[key] = float(np.mean((true_val - est_val) ** 2))
             if not per_key:
                 continue
+
+            # "latent C_i": same MSE, but between the DiT's own hidden-state
+            # representations rather than the decoded action - see module
+            # docstring's "Two C_i metrics" section. None (not 0.0/omitted)
+            # when unavailable (e.g. wrapped policy doesn't support
+            # return_latent) so the JSONL schema stays stable either way.
+            latent_c_i = None
+            cached_latent = latent_history_by_index.get(target_index)
+            if cached_latent is not None and backward_latent is not None:
+                est_latent = np.asarray(backward_latent[0])
+                if cached_latent.shape == est_latent.shape:
+                    latent_c_i = float(np.mean((cached_latent - est_latent) ** 2))
+
             rows.append(
                 {
                     "env_slot": slot,
                     "call_index": call_index,
                     "depth": depth,
-                    "c_i": float(np.mean(list(per_key.values()))),
+                    "action_c_i": float(np.mean(list(per_key.values()))),
+                    "latent_c_i": latent_c_i,
                     "episode_id": episode_id,
                     "task": task,
                     "per_key": per_key,

@@ -113,12 +113,15 @@ clean log rather than old and new rows mixed together).
    with a couple more or fewer episodes than requested, so a simple average would
    silently misweight the small tasks).
 5. Joins each task's per-episode outcome against the round-trip log's
-   `task`/`episode_id`/`c_i` fields and writes
-   `round_trip_consistency/correlation_summary.json`: mean $\mathcal{C}_i$
-   (averaged over every depth and check logged during that episode) for failed vs.
-   succeeded episodes, per task and overall. This is descriptive, not a
-   statistical test — treat it as a first read on whether $\mathcal{C}_i$ tracks
-   failure on this run, not a significance claim.
+   `task`/`episode_id`/`action_c_i` fields and writes
+   `round_trip_consistency/correlation_summary.json`: mean action-space
+   $\mathcal{C}_i$ (averaged over every depth and check logged during that
+   episode) for failed vs. succeeded episodes, per task and overall. This is
+   descriptive, not a statistical test — treat it as a first read on whether
+   $\mathcal{C}_i$ tracks failure on this run, not a significance claim. The
+   JSONL log also carries a `latent_c_i` field (pre-decoder DiT-hidden-state
+   MSE — see `round_trip_monitor.py`'s "Two C_i metrics" section) that this
+   correlation step doesn't join against yet — a real, separate follow-up.
 6. Always stops the server on exit (success, failure, or Ctrl-C) via a trap on the
    process group it was started in.
 
@@ -136,8 +139,9 @@ examples/LIBERO/logs/eval_results/libero_10-rtc/
 │   └── <TASK_NAME>.log                 # tail -100 of that task's rollout_policy.py run
 ├── round_trip_consistency/
 │   ├── libero_10_rtc.jsonl             # one row per {env_slot, call_index, depth}; every
-│   │                                    # row tagged with task + episode_id + c_i + per_key
-│   └── correlation_summary.json        # mean C_i for failed vs. succeeded episodes
+│   │                                    # row tagged with task + episode_id + action_c_i +
+│   │                                    # latent_c_i + per_key
+│   └── correlation_summary.json        # mean action_c_i for failed vs. succeeded episodes
 └── summary.json                        # aggregated per-task + overall success rate
 ```
 
