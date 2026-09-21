@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
-# Reproduce the libero_10-rtc (Long) closed-loop benchmark, with the
-# server-side round-trip-consistency (RTC) diagnostic enabled.
+# Reproduce the libero_10-rtc (Long) closed-loop benchmark, with both
+# round-trip-consistency (RTC) mechanisms enabled: the server-side monitor
+# (--enable-round-trip-monitor, Mechanism 1) and the client-side check
+# (--enable-round-trip-check, Mechanism 2 - gr00t/policy/round_trip_monitor.py's
+# "Two C_i metrics" section covers what action_c_i/latent_c_i mean for both).
 #
-# Starts a GR00T inference server for the given RTC checkpoint (with
-# --enable-round-trip-monitor), then runs the client
-# (gr00t/eval/rollout_policy.py) against all 10 LIBERO-10 tasks in sequence.
-# For each task this saves: the rollout videos, a JSON dump of the task's
-# `results` return value (env_name, per-episode successes, and episode_infos
-# - including the per-episode round_trip_episode_id used below to attribute
-# C_i to individual episodes), and a truncated (tail -100) log of that
-# rollout_policy.py run. The server's round-trip-consistency JSONL log
-# (one file for the whole run, tagged per-row with task/episode_id) is saved
-# alongside. A summary.json aggregating all 10 tasks, plus a
-# round_trip_consistency/correlation_summary.json comparing mean C_i on
-# failed vs. succeeded episodes, is written at the end.
+# Starts a GR00T inference server for the given RTC checkpoint, then runs the
+# client (gr00t/eval/rollout_policy.py) against all 10 LIBERO-10 tasks in
+# sequence. For each task this saves: the rollout videos - each with a
+# C_i(action)/C_i(latent) caption line per depth (Mechanism 2, since
+# --video-dir is set) - and a matching per-episode C_i-vs-step plot
+# (VideoRecordingWrapper._save_round_trip_plot) alongside every kept video; a
+# JSON dump of the task's `results` return value (env_name, per-episode
+# successes, and episode_infos - including the per-episode
+# round_trip_episode_id used below to attribute C_i to individual episodes,
+# and Mechanism 2's own round_trip_action_c_i_depth{depth}/
+# round_trip_latent_c_i_depth{depth} entries); and a truncated (tail -100)
+# log of that rollout_policy.py run. The server's round-trip-consistency
+# JSONL log (one file for the whole run, tagged per-row with task/episode_id,
+# named after the checkpoint - see CHECKPOINT_NAME below) is saved alongside.
+# A summary.json aggregating all 10 tasks, plus a
+# round_trip_consistency/correlation_summary.json comparing mean action_c_i
+# on failed vs. succeeded episodes (from Mechanism 1's JSONL log), is written
+# at the end.
 #
 # Usage:
 #   bash examples/LIBERO/eval_libero_10_rtc.sh
@@ -33,6 +42,14 @@ cd "$REPO_ROOT"
 
 # ---- Configuration (override via environment variables) --------------------
 MODEL_PATH="${MODEL_PATH:-examples/LIBERO/logs/libero-rtc/libero_10-rtc}"
+# Checkpoint dir's own basename, e.g. "libero_10-rtc" or
+# "2026-09-19_gr00t-n17_rtc_libero-panda_libero-10" - used below to keep
+# different checkpoints' OUTPUT_ROOT/RTC_LOG_PATH defaults from colliding
+# (rerunning against a different checkpoint without this would either mix
+# its results into another checkpoint's directory, or have SKIP_EXISTING=1
+# silently skip every task because that directory's result JSONs already
+# exist from the OTHER checkpoint's run).
+CHECKPOINT_NAME="$(basename "$MODEL_PATH")"
 EMBODIMENT_TAG="${EMBODIMENT_TAG:-LIBERO_PANDA}"
 N_EPISODES="${N_EPISODES:-50}"
 SEED="${SEED:-42}"
@@ -42,19 +59,21 @@ MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-720}"
 PORT="${PORT:-5555}"
 MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
 HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-examples/LIBERO/logs/eval_results/libero_10-rtc}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-examples/LIBERO/logs/eval_results/$CHECKPOINT_NAME}"
 VIDEO_ROOT="${VIDEO_ROOT:-$OUTPUT_ROOT/sim_eval_videos}"
 SERVER_STARTUP_TIMEOUT="${SERVER_STARTUP_TIMEOUT:-600}"
-# Round-trip-consistency options. --round-trip-check-interval MUST equal
+# Round-trip-consistency options. --round-trip-check-interval defaults to
 # N_ACTION_STEPS - the server has no way to see the client's execution
-# horizon, so a mismatch silently makes depth i no longer correspond to i
-# actual chunk executions. Kept derived, not independently overridable, for
-# exactly that reason (see HANDOFF_ROUND_TRIP_CONSISTENCY.md).
-ROUND_TRIP_CHECK_INTERVAL="$N_ACTION_STEPS"
+# horizon, so a mismatch means depth i no longer corresponds to i actual
+# chunk executions (see HANDOFF_ROUND_TRIP_CONSISTENCY.md). Independently
+# overridable for a deliberate ablation (e.g. checking every macro-step
+# instead of every chunk execution) - the caller is responsible for that
+# tradeoff when setting it explicitly.
+ROUND_TRIP_CHECK_INTERVAL="${ROUND_TRIP_CHECK_INTERVAL:-$N_ACTION_STEPS}"
 # shellcheck disable=SC2206
 ROUND_TRIP_DEPTHS=(${ROUND_TRIP_DEPTHS:-1 2 4})
 RTC_DIR="$OUTPUT_ROOT/round_trip_consistency"
-RTC_LOG_PATH="${RTC_LOG_PATH:-$RTC_DIR/libero_10_rtc.jsonl}"
+RTC_LOG_PATH="${RTC_LOG_PATH:-$RTC_DIR/$CHECKPOINT_NAME.jsonl}"
 # Skip a task whose result JSON already exists (lets a killed/interrupted run
 # resume without redoing already-completed tasks). Set to 0 to force a full
 # rerun of every task.
@@ -174,6 +193,9 @@ for TASK in "${TASKS[@]}"; do
     --n-envs "$N_ENVS" \
     --seed "$SEED" \
     --video-dir "$VIDEO_ROOT/$TASK" \
+    --enable-round-trip-check \
+    --round-trip-check-interval "$ROUND_TRIP_CHECK_INTERVAL" \
+    --round-trip-depths "${ROUND_TRIP_DEPTHS[@]}" \
     >"$FULL_LOG" 2>&1
   CLIENT_EXIT=$?
   set -e

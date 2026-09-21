@@ -22,7 +22,7 @@ this mirrors).
 ``RoundTripMonitor`` wraps any ``BasePolicy`` transparently. Every
 ``round_trip_check_interval`` ``get_action`` calls, for each env-batch slot, it issues one
 additional internal query of the wrapped policy's backward direction
-(``options={"direction": 1, "drop_vision": True}``) anchored on the *current* observation,
+(``options={"direction": 1, "drop_vision": False}``) anchored on the *current* observation,
 decodes the reconstructed past state, and diffs it against a cached true state from
 ``depth`` calls ago for each requested depth. Results are appended to a JSONL sidecar log -
 independent of any one benchmark's own result format, the same pattern RoboLab itself uses
@@ -96,9 +96,18 @@ Caveats (see the plan for the full discussion):
   this is a rare, not systemic, contamination even then.
 - **One extra ``get_action`` call per env slot every ``round_trip_check_interval`` calls is a
   real, non-optional compute cost** (e.g. +12.5% at interval=8) - budget for it.
-- **``drop_vision=True`` is intentional, not a shortcut**: the model was only ever trained
-  with backward examples vision-dropped by default (``vision_dropout_prob_backward=1.0``),
-  so querying with real vision here would be out-of-training-distribution.
+- **``drop_vision=False`` is a deliberate choice, not an oversight - but whether it's
+  in-distribution depends on the loaded checkpoint**: ``vision_dropout_prob_backward`` is a
+  per-checkpoint training hyperparameter, not a model-architecture constant. It was ``1.0``
+  (backward examples always vision-dropped) for the original ``libero-rtc/libero_10-rtc``
+  checkpoint this monitor was first validated against - for that checkpoint,
+  ``drop_vision=False`` here queries a combination it never saw in training. It was only
+  ``0.2`` for a later checkpoint
+  (``2026-09-19_gr00t-n17_rtc_libero-panda_libero-10``), whose backward examples mostly
+  (80%) *kept* real vision during training - for that one, ``drop_vision=False`` is close to
+  the dominant training condition, not a departure from it. This monitor has no way to know
+  which regime the loaded checkpoint falls into, so treat any given run's ``action_c_i``/
+  ``latent_c_i`` numbers with that in mind rather than assuming a fixed interpretation.
 """
 
 from __future__ import annotations
@@ -386,8 +395,12 @@ class RoundTripMonitor(PolicyWrapper):
         task: str | None,
     ) -> None:
         single_obs = _slice_observation(observation, slot)
+        # drop_vision=False: see module docstring's drop_vision caveat -
+        # whether this is in- or out-of-training-distribution depends on the
+        # loaded checkpoint's own vision_dropout_prob_backward, which this
+        # monitor has no way to know.
         backward_action, backward_info = self.policy.get_action(
-            single_obs, options={"direction": 1, "drop_vision": True, "return_latent": True}
+            single_obs, options={"direction": 1, "drop_vision": False, "return_latent": True}
         )
         backward_state = _modality_dict(backward_action, "action")
         backward_latent = backward_info.get("latent_pred")  # (1, hidden_size) or None

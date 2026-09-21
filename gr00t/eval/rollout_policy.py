@@ -382,8 +382,23 @@ def _update_round_trip_state(
         # e.g. still early in the rollout - so skip issuing it at all.
         return
 
+    # drop_vision=False here (unlike Mechanism 1's RoundTripMonitor._check_slot,
+    # which keeps drop_vision=True - see round_trip_monitor.py's module
+    # docstring): a deliberate ablation conditioning Mechanism 2's backward
+    # query on real vision. vision_dropout_prob_backward is a per-checkpoint
+    # training hyperparameter, not a model-architecture constant - it's 1.0
+    # (always drop) for the original libero-rtc/libero_10-rtc checkpoint
+    # round_trip_monitor.py's docstring was written against (making
+    # drop_vision=False properly out-of-distribution there), but only 0.2 for
+    # 2026-09-19_gr00t-n17_rtc_libero-panda_libero-10, whose backward examples
+    # mostly (80%) kept real vision during training - so this same
+    # drop_vision=False setting is much closer to that checkpoint's own
+    # training distribution, not further from it. Whether this is an
+    # in-distribution or out-of-distribution query therefore depends on which
+    # checkpoint is loaded server-side, which this client has no way to know;
+    # treat any given run's action_c_i/latent_c_i numbers accordingly.
     backward_action, backward_info = policy.get_action(
-        observations, options={"direction": 1, "drop_vision": True, "return_latent": True}
+        observations, options={"direction": 1, "drop_vision": False, "return_latent": True}
     )
     backward_state = _modality_dict(backward_action, "action")
     reconstructed = {

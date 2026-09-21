@@ -528,6 +528,31 @@ silently unexercised by any test before now). `tests/gr00t/eval/sim/wrapper
 Full CPU suite re-run after all of the above with no new failures beyond the two known
 pre-existing environmental ones.
 
+**Both mechanisms' backward query now uses `drop_vision=False`, not `drop_vision=True`.**
+Originally `drop_vision=True` was documented as "intentional, not a shortcut" (both
+mechanisms' code comments and this doc used to say so) on the reasoning that the model was
+only ever trained with backward examples vision-dropped by default
+(`vision_dropout_prob_backward=1.0`), so querying with real vision would be
+out-of-training-distribution. That reasoning holds for the original
+`libero-rtc/libero_10-rtc` checkpoint everything above was validated against, but
+**`vision_dropout_prob_backward` turns out to be a per-checkpoint training hyperparameter,
+not a model-architecture constant**: a later checkpoint,
+`2026-09-19_gr00t-n17_rtc_libero-panda_libero-10`, was trained with it at only `0.2` — 80%
+of its backward examples *kept* real vision, making `drop_vision=False` close to that
+checkpoint's dominant training condition rather than a departure from it. Neither mechanism
+has any way to know which regime a given loaded checkpoint falls into, so
+`drop_vision=False` is now the shared default for both — an explicit choice, not an
+oversight — with both `round_trip_monitor.py`'s module docstring and
+`rollout_policy.py`'s `_update_round_trip_state` carrying comments explaining this
+checkpoint-dependent caveat rather than asserting a single fixed interpretation. A live
+comparison run (`2026-09-19_gr00t-n17_rtc_libero-panda_libero-10`,
+`KITCHEN_SCENE8_put_both_moka_pots_on_the_stove`, `drop_vision=True` n=10 vs.
+`drop_vision=False` n=50) found `action_c_i`/`latent_c_i` means barely moved between the two
+settings — consistent with `drop_vision=False` not being strongly out-of-distribution for
+that particular checkpoint, as the revised reasoning above predicts — though `latent_c_i`'s
+spread across episodes did shrink roughly 3x with real vision present, a real if modest
+effect worth watching on other checkpoints.
+
 ### LIBERO Goal closed-loop benchmark: RTC vs. baseline (real sim, real rollouts)
 
 Ran the full LIBERO Goal suite (10 tasks) closed-loop, 10 episodes/task, 5 parallel envs,

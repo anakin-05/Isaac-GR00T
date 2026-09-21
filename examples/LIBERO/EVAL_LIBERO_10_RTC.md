@@ -1,12 +1,18 @@
 # Reproducing the LIBERO-10 round-trip-consistency (RTC) closed-loop eval
 
 `eval_libero_10_rtc.sh` reproduces the closed-loop LIBERO-10 (Long) benchmark for
-the `libero_10-rtc` checkpoint, with the server-side round-trip-consistency (RTC)
-diagnostic enabled: it starts a GR00T inference server with
-`--enable-round-trip-monitor`, then runs the LIBERO sim client against all 10
-LIBERO-10 tasks in sequence, saving videos, a JSON dump of each task's result, a
-log of each run, the round-trip-consistency JSONL log, and a C_i-vs-outcome
-correlation summary.
+the `libero_10-rtc` checkpoint, with both round-trip-consistency (RTC) mechanisms
+enabled: it starts a GR00T inference server with `--enable-round-trip-monitor`
+(Mechanism 1, server-side), then runs the LIBERO sim client with
+`--enable-round-trip-check` (Mechanism 2, client-side) against all 10 LIBERO-10
+tasks in sequence. Because Mechanism 2 and `--video-dir` are both set, every kept
+episode's video gets a `C_i(action)`/`C_i(latent)` caption per depth and a matching
+per-episode C_i-vs-step plot alongside it (see `gr00t/policy/round_trip_monitor.py`'s
+"Two C_i metrics" section for what the two metrics are). Also saves a JSON dump of
+each task's result (including Mechanism 2's own C_i entries in `episode_infos`), a
+log of each run, Mechanism 1's round-trip-consistency JSONL log (named after the
+checkpoint - see `CHECKPOINT_NAME`/`RTC_LOG_PATH` below), and a C_i-vs-outcome
+correlation summary built from that JSONL log.
 
 This only makes sense against a checkpoint that was fine-tuned with
 `--enable-direction-conditioning` — see
@@ -85,22 +91,29 @@ clean log rather than old and new rows mixed together).
 
 1. Starts `gr00t/eval/run_gr00t_server.py --model-path <checkpoint>
    --use-sim-policy-wrapper --enable-round-trip-monitor
-   --round-trip-check-interval <N_ACTION_STEPS> --round-trip-depths 1 2 4
+   --round-trip-check-interval <ROUND_TRIP_CHECK_INTERVAL> --round-trip-depths 1 2 4
    --round-trip-log-path <path>` in the background (top-level `.venv`, via
    `uv run`), and waits for it to actually accept connections on `PORT` before
    running any client — model loading is synchronous and completes before the
    server starts listening, so a successful connection is a reliable "ready"
-   signal, not a fixed sleep. `--round-trip-check-interval` is always set equal
-   to `N_ACTION_STEPS`, not independently configurable — the server has no way to
-   see the client's execution horizon, so a mismatch here silently makes depth
-   `i` no longer correspond to `i` actual chunk executions.
-2. For each of the 10 LIBERO-10 tasks, runs `gr00t/eval/rollout_policy.py` as a
-   client (in `libero_uv/.venv`) against that server, sequentially — one task at a
-   time, since there's only one server/checkpoint here. The round-trip monitor
-   attributes every logged row to a `task` and per-slot `episode_id` (see
-   "Later addition: per-episode and per-task identity" in
-   `HANDOFF_ROUND_TRIP_CONSISTENCY.md`), so all 10 tasks can safely share one
-   continuous JSONL log.
+   signal, not a fixed sleep. `--round-trip-check-interval` defaults to
+   `N_ACTION_STEPS` — the server has no way to see the client's execution
+   horizon, so a mismatch here means depth `i` no longer corresponds to `i`
+   actual chunk executions — but is independently overridable via
+   `ROUND_TRIP_CHECK_INTERVAL` for a deliberate ablation (e.g. checking every
+   macro-step instead of every chunk execution); set it explicitly only if you
+   understand and want that tradeoff.
+2. For each of the 10 LIBERO-10 tasks, runs `gr00t/eval/rollout_policy.py --enable-round-trip-check
+   --round-trip-check-interval <ROUND_TRIP_CHECK_INTERVAL> --round-trip-depths 1 2 4`
+   (Mechanism 2) as a client (in `libero_uv/.venv`) against that server,
+   sequentially — one task at a time, since there's only one server/checkpoint
+   here. Mechanism 1 (the server-side monitor) attributes every logged row to a
+   `task` and per-slot `episode_id` (see "Later addition: per-episode and
+   per-task identity" in `HANDOFF_ROUND_TRIP_CONSISTENCY.md`), so all 10 tasks
+   can safely share one continuous JSONL log. Mechanism 2 runs independently on
+   the client and, since `--video-dir` is also set, burns its own C_i values
+   into each kept episode's video caption and a matching per-episode plot -
+   see `gr00t/eval/sim/wrapper/video_recording_wrapper.py`.
 3. Captures each client run's full output, keeps the last 100 lines as that task's
    log, and parses the `results:  (env_name, successes, episode_infos)` line
    `rollout_policy.py` prints out of it (via `ast.literal_eval`, then
@@ -128,9 +141,11 @@ clean log rather than old and new rows mixed together).
 ## Output layout
 
 ```
-examples/LIBERO/logs/eval_results/libero_10-rtc/
+examples/LIBERO/logs/eval_results/<CHECKPOINT_NAME>/
 ├── sim_eval_videos/
-│   └── <TASK_NAME>/                    # one subdir per task; rollout_policy.py's --video-dir
+│   └── <TASK_NAME>/                    # one subdir per task; rollout_policy.py's --video-dir -
+│                                        # each kept video has a C_i(action)/C_i(latent) caption
+│                                        # and a matching <video-name>.png plot alongside it
 ├── results/
 │   └── <TASK_NAME>.json                # {task, env_name, n_episodes, n_success, success_rate,
 │                                        #  successes, episode_infos} for that task's `results`
@@ -138,7 +153,7 @@ examples/LIBERO/logs/eval_results/libero_10-rtc/
 │   ├── server.log                      # full server output for the whole run
 │   └── <TASK_NAME>.log                 # tail -100 of that task's rollout_policy.py run
 ├── round_trip_consistency/
-│   ├── libero_10_rtc.jsonl             # one row per {env_slot, call_index, depth}; every
+│   ├── <CHECKPOINT_NAME>.jsonl          # one row per {env_slot, call_index, depth}; every
 │   │                                    # row tagged with task + episode_id + action_c_i +
 │   │                                    # latent_c_i + per_key
 │   └── correlation_summary.json        # mean action_c_i for failed vs. succeeded episodes
@@ -150,28 +165,28 @@ examples/LIBERO/logs/eval_results/libero_10-rtc/
 | Variable | Default | Meaning |
 |---|---|---|
 | `MODEL_PATH` | `examples/LIBERO/logs/libero-rtc/libero_10-rtc` | Checkpoint directory passed to the server; must be direction-conditioned |
+| `CHECKPOINT_NAME` | `$(basename "$MODEL_PATH")` | Not independently settable - derived from `MODEL_PATH`. Used as the default `OUTPUT_ROOT`/`RTC_LOG_PATH` basename so two different checkpoints never collide or silently skip each other's tasks via `SKIP_EXISTING` |
 | `EMBODIMENT_TAG` | `LIBERO_PANDA` | Passed to the server |
 | `N_EPISODES` | `50` | Episodes per task |
 | `SEED` | `42` | Forwarded to `rollout_policy.py --seed`; seeds Python/NumPy/torch/cuda RNGs and gives each parallel env a distinct, deterministic per-env seed (`seed + env_idx`) |
 | `N_ENVS` | `5` | Parallel envs per task |
-| `N_ACTION_STEPS` | `8` | Receding-horizon execution length; also drives `ROUND_TRIP_CHECK_INTERVAL` (see below) |
+| `N_ACTION_STEPS` | `8` | Receding-horizon execution length; also the default for `ROUND_TRIP_CHECK_INTERVAL` (see below) |
 | `MAX_EPISODE_STEPS` | `720` | Per-episode step budget |
 | `PORT` | `5555` | Server port |
 | `MUJOCO_EGL_DEVICE_ID` | `0` | Offscreen-rendering GPU index (see Prerequisites) |
 | `HF_HUB_DISABLE_XET` | `1` | Works around the HF Xet backend hanging on some hosts |
 | `ROUND_TRIP_DEPTHS` | `1 2 4` | Rollout depths (in get_action calls) the monitor evaluates |
-| `RTC_LOG_PATH` | `$OUTPUT_ROOT/round_trip_consistency/libero_10_rtc.jsonl` | Round-trip JSONL sidecar path |
-| `OUTPUT_ROOT` | `examples/LIBERO/logs/eval_results/libero_10-rtc` | Base output directory |
+| `RTC_LOG_PATH` | `$OUTPUT_ROOT/round_trip_consistency/$CHECKPOINT_NAME.jsonl` | Round-trip JSONL sidecar path |
+| `OUTPUT_ROOT` | `examples/LIBERO/logs/eval_results/$CHECKPOINT_NAME` | Base output directory |
 | `VIDEO_ROOT` | `$OUTPUT_ROOT/sim_eval_videos` | Video base directory |
 | `SERVER_STARTUP_TIMEOUT` | `600` (seconds) | How long to wait for the server before giving up |
 | `SKIP_EXISTING` | `1` | Skip a task whose result JSON already exists |
 | `TASKS_OVERRIDE` | (unset = full 10) | Space-separated task-name subset, for smoke tests |
+| `ROUND_TRIP_CHECK_INTERVAL` | `$N_ACTION_STEPS` | Server-side check cadence; independently overridable for a deliberate depth-semantics ablation (see "What it does" above) |
 
-`ROUND_TRIP_CHECK_INTERVAL` is not independently settable — it is always
-`N_ACTION_STEPS` (see "What it does" above for why). `CUDA_VISIBLE_DEVICES` is read
-from your shell as-is (not listed above since the script never sets a default for
-it) — required, since the server otherwise defaults to whatever GPU is
-visible/free on your machine.
+`CUDA_VISIBLE_DEVICES` is read from your shell as-is (not listed above since the
+script never sets a default for it) — required, since the server otherwise
+defaults to whatever GPU is visible/free on your machine.
 
 ## Runtime
 
