@@ -83,6 +83,13 @@ class VideoConfig:
             latest known C_i, and a per-episode C_i-vs-step plot is saved
             alongside each kept video. None disables both - see
             VideoRecordingWrapper.
+        round_trip_live_plot: Only used when round_trip_depths is set. Appends
+            a live C_i-vs-step panel to the right of every recorded frame, so
+            the exported video shows C_i evolving alongside the rollout.
+        raw_video: Export the camera footage as-is - no caption strip and no
+            live C_i panel (overrides overlay_text and round_trip_live_plot).
+            With round_trip_depths set, C_i is still saved per recorded frame
+            in a JSON sidecar next to each video for the HTML viewer.
     """
 
     video_dir: str | None = None
@@ -93,6 +100,8 @@ class VideoConfig:
     overlay_text: bool = True
     record_video_keys: tuple[str, ...] | None = None
     round_trip_depths: tuple[int, ...] | None = None
+    round_trip_live_plot: bool = True
+    raw_video: bool = False
 
 
 @dataclass
@@ -226,6 +235,8 @@ def create_eval_env(
             overlay_text=wrapper_configs.video.overlay_text,
             record_video_keys=record_video_keys,
             round_trip_depths=wrapper_configs.video.round_trip_depths,
+            round_trip_live_plot=wrapper_configs.video.round_trip_live_plot,
+            raw_video=wrapper_configs.video.raw_video,
             env_idx=env_idx,
         )
 
@@ -941,6 +952,8 @@ def run_gr00t_sim_policy(
     enable_round_trip_check: bool = False,
     round_trip_check_interval: int = 8,
     round_trip_depths: tuple[int, ...] = (1, 2, 4),
+    round_trip_live_plot: bool = True,
+    raw_video: bool = False,
 ):
     # seed_everything resolves `None` via the GR00T_EVAL_SEED env var and is a
     # no-op when that is also unset, so the historical non-deterministic
@@ -998,6 +1011,8 @@ def run_gr00t_sim_policy(
                 video_dir=video_dir,
                 max_episode_steps=max_episode_steps,
                 round_trip_depths=round_trip_depths if enable_round_trip_check else None,
+                round_trip_live_plot=round_trip_live_plot,
+                raw_video=raw_video,
             ),
         )
 
@@ -1014,6 +1029,17 @@ def run_gr00t_sim_policy(
             round_trip_depths=round_trip_depths,
         )
         print("Video saved to: ", wrapper_configs.video.video_dir)
+        if enable_round_trip_check:
+            # Best-effort: the viewer is a convenience on top of the videos and
+            # their C_i sidecars, which are already on disk either way.
+            try:
+                from gr00t.eval.sim.round_trip_viewer import build_task_viewer
+
+                viewer = build_task_viewer(Path(wrapper_configs.video.video_dir), title=env_name)
+                if viewer is not None:
+                    print("C_i viewer written to: ", viewer)
+            except Exception:
+                logger.exception("Failed to build the round-trip C_i HTML viewer.")
         return results
 
 
@@ -1086,6 +1112,20 @@ class RolloutConfig:
     """Rollout depths (in macro-steps) Mechanism 2 evaluates. Only used when
     enable_round_trip_check is set."""
 
+    round_trip_live_plot: bool = True
+    """Render a live C_i-vs-step panel side by side with the rollout footage
+    in every exported video (action_c_i and latent_c_i, one line per depth,
+    with a current-step cursor). Only used when enable_round_trip_check is set
+    and videos are recorded; pass --no-round-trip-live-plot to turn it off."""
+
+    raw_video: bool = False
+    """Export the raw camera footage only: no caption overlay and no live
+    C_i panel (overrides --round-trip-live-plot). With
+    --enable-round-trip-check, each video still gets a <video>.json sidecar
+    with C_i per recorded frame, and an index.html viewer is written to the
+    video directory that plays each video next to toggleable, time-synced
+    C_i plots."""
+
 
 if __name__ == "__main__":
     args = tyro.cli(RolloutConfig)
@@ -1117,6 +1157,8 @@ if __name__ == "__main__":
         enable_round_trip_check=args.enable_round_trip_check,
         round_trip_check_interval=args.round_trip_check_interval,
         round_trip_depths=args.round_trip_depths,
+        round_trip_live_plot=args.round_trip_live_plot,
+        raw_video=args.raw_video,
     )
     print("results: ", results)
     print("success rate: ", np.mean(results[1]))

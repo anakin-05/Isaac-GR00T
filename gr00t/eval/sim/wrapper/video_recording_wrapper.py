@@ -14,6 +14,8 @@
 # limitations under the License.
 
 from collections.abc import Sequence
+import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -32,6 +34,27 @@ _H264_CRF = "18"
 _H264_PROFILE = "high"
 _H264_PIXEL_FORMAT = "yuv420p"
 
+# Live round-trip C_i plot panel (see VideoRecordingWrapper's
+# round_trip_live_plot). Dark chart surface and text inks so the panel sits
+# naturally next to the black caption strip; one fixed categorical hue per
+# depth, assigned in order and never cycled (a depth list longer than this is
+# rejected rather than repainting depths with reused colors).
+_LIVE_PLOT_SURFACE = "#1a1a19"
+_LIVE_PLOT_TEXT = "#ffffff"
+_LIVE_PLOT_TEXT_MUTED = "#c3c2b7"
+_LIVE_PLOT_GRID = "#3a3a37"
+_LIVE_PLOT_AXIS = "#4a4a47"
+_LIVE_PLOT_DEPTH_COLORS = ("#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300")
+# RGB (the encoder is fed rgb24) of the current-step cursor line.
+_LIVE_PLOT_CURSOR_RGB = (195, 194, 183)
+# Panel width relative to the composed frame's height.
+_LIVE_PLOT_ASPECT = 1.2
+# Re-render the matplotlib panel at least every this many recorded frames even
+# when no new C_i arrived, so the held-value tail keeps up with the cursor.
+# Between re-renders only the cursor is redrawn (cheap cv2 line on a cached
+# image), which keeps per-frame cost negligible.
+_LIVE_PLOT_REDRAW_EVERY = 4
+
 
 class VideoRecordingWrapper(gym.Wrapper):
     def __init__(
@@ -46,6 +69,8 @@ class VideoRecordingWrapper(gym.Wrapper):
         overlay_text=True,
         record_video_keys: Sequence[str] | None = None,
         round_trip_depths: Sequence[int] | None = None,
+        round_trip_live_plot: bool = True,
+        raw_video: bool = False,
         env_idx: int = 0,
         **kwargs,
     ):
@@ -66,6 +91,25 @@ class VideoRecordingWrapper(gym.Wrapper):
         actually arrived yet for a given episode, so the encoded frame shape
         never has to change mid-episode when the first value shows up
         partway through.
+
+        round_trip_live_plot: only meaningful when round_trip_depths is set.
+        Renders a live C_i-vs-step panel (action_c_i on top, latent_c_i
+        below, one line per depth, x-axis fixed to the episode's step budget,
+        a cursor at the current step) and appends it to the right of every
+        recorded frame, so C_i can be watched evolving alongside the rollout
+        in the exported video itself. The per-episode PNG plot is still saved
+        either way.
+
+        raw_video: export the camera footage exactly as observed - no caption
+        strip (overrides overlay_text) and no live C_i panel (overrides
+        round_trip_live_plot). C_i is still tracked when round_trip_depths is
+        set, so the per-episode PNG and data file below are still written.
+
+        Whenever round_trip_depths is set, every kept video also gets a
+        ``<video stem>.json`` sidecar holding the episode's C_i values per
+        recorded frame (see _save_round_trip_data), which
+        gr00t/eval/sim/round_trip_viewer.py turns into an HTML page that plays
+        the video next to interactive, time-synced C_i plots.
 
         env_idx: this sub-env's position in the vectorized batch. Needed
         because ``set_round_trip_overlay`` receives the *whole* per-slot list
@@ -97,10 +141,24 @@ class VideoRecordingWrapper(gym.Wrapper):
         self.video_shape = None
         self.video_dtype = None
         self.file_path = None
-        self.overlay_text = overlay_text
+        self.raw_video = bool(raw_video)
+        self.overlay_text = overlay_text and not self.raw_video
         self.record_video_keys = tuple(record_video_keys) if record_video_keys is not None else None
         self.round_trip_depths = tuple(round_trip_depths) if round_trip_depths is not None else None
+        self.round_trip_live_plot = (
+            bool(round_trip_live_plot) and self.round_trip_depths is not None and not self.raw_video
+        )
+        if self.round_trip_live_plot and len(self.round_trip_depths) > len(_LIVE_PLOT_DEPTH_COLORS):
+            raise ValueError(
+                f"round_trip_live_plot supports at most {len(_LIVE_PLOT_DEPTH_COLORS)} depths "
+                f"(got {len(self.round_trip_depths)}); pass fewer round_trip_depths or "
+                "disable the live plot"
+            )
         self._env_idx = env_idx
+        # Per-episode live-plot state (figure, cached panel image, axes pixel
+        # spans for the cursor); built lazily on the first recorded frame,
+        # once the composed frame height is known, and dropped on reset.
+        self._live_plot: dict | None = None
 
         self.step_count = 0
 
@@ -308,6 +366,187 @@ class VideoRecordingWrapper(gym.Wrapper):
         finally:
             plt.close(fig)
 
+    def _save_round_trip_data(self, path: Path, video_path: Path, success: bool) -> None:
+        """Write the episode's C_i history next to its video, one entry per
+        recorded frame, so the values can be lined up with the video exactly:
+        frame ``k`` of the mp4 (time ``k / fps``) shows env step
+        ``frame_steps[k]``, and ``action_c_i[depth][k]`` /
+        ``latent_c_i[depth][k]`` are the latest known values at that frame
+        (null until a depth's first value arrives). Values are held between
+        round-trip checks, exactly as the caption and live panel show them.
+        Non-finite values are written as null so the file stays valid JSON
+        for a browser's JSON.parse."""
+
+        def _clean(value):
+            if value is None:
+                return None
+            value = float(value)
+            return value if math.isfinite(value) else None
+
+        def _column(series_idx: int, depth: int) -> list:
+            return [_clean(entry[series_idx].get(depth)) for entry in self._round_trip_series]
+
+        payload = {
+            "format": "gr00t_round_trip_ci/v1",
+            "video": video_path.name,
+            "fps": self.video_fps,
+            "steps_per_render": self.steps_per_render,
+            "max_episode_steps": self.max_episode_steps,
+            "success": bool(success),
+            "depths": list(self.round_trip_depths),
+            "frame_steps": [entry[0] for entry in self._round_trip_series],
+            "action_c_i": {str(d): _column(1, d) for d in self.round_trip_depths},
+            "latent_c_i": {str(d): _column(2, d) for d in self.round_trip_depths},
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f, separators=(",", ":"))
+
+    def _init_live_plot(self, height: int) -> None:
+        """Build this episode's live-plot figure, sized so its panel exactly
+        matches the composed frame's height (and an even width, for H.264).
+        Uses Figure + FigureCanvasAgg directly rather than pyplot, so it
+        carries no global pyplot state and is never shown or tracked by
+        pyplot's figure manager. Two stacked axes, not one shared y-axis:
+        action_c_i and latent_c_i live on unrelated scales (see
+        round_trip_monitor.py's "Two C_i metrics" section)."""
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        width = int(round(height * _LIVE_PLOT_ASPECT))
+        width -= width % 2
+        dpi = 100
+        fig = Figure(figsize=(width / dpi, height / dpi), dpi=dpi, facecolor=_LIVE_PLOT_SURFACE)
+        canvas = FigureCanvasAgg(fig)
+        ax_action, ax_latent = fig.subplots(2, 1, sharex=True)
+        lines: dict[tuple[str, int], object] = {}
+        for ax, metric, label in (
+            (ax_action, "action", "C_i (action)"),
+            (ax_latent, "latent", "C_i (latent)"),
+        ):
+            ax.set_facecolor(_LIVE_PLOT_SURFACE)
+            ax.set_xlim(0, self.max_episode_steps)
+            ax.set_ylim(0, 1)
+            ax.set_ylabel(label, color=_LIVE_PLOT_TEXT_MUTED, fontsize=7)
+            ax.tick_params(colors=_LIVE_PLOT_TEXT_MUTED, labelsize=6, length=2, width=0.6)
+            for side, spine in ax.spines.items():
+                if side in ("top", "right"):
+                    spine.set_visible(False)
+                else:
+                    spine.set_color(_LIVE_PLOT_AXIS)
+                    spine.set_linewidth(0.6)
+            ax.grid(True, color=_LIVE_PLOT_GRID, linewidth=0.5)
+            for depth, color in zip(self.round_trip_depths, _LIVE_PLOT_DEPTH_COLORS):
+                (line,) = ax.plot([], [], color=color, linewidth=1.5, label=f"depth {depth}")
+                lines[(metric, depth)] = line
+        ax_action.set_title(
+            "Round-trip consistency C_i (live)", color=_LIVE_PLOT_TEXT, fontsize=7, pad=3
+        )
+        ax_action.legend(
+            loc="upper left",
+            fontsize=6,
+            frameon=False,
+            labelcolor=_LIVE_PLOT_TEXT,
+            ncol=len(self.round_trip_depths),
+            handlelength=1.2,
+            columnspacing=0.8,
+        )
+        ax_latent.set_xlabel("step", color=_LIVE_PLOT_TEXT_MUTED, fontsize=7)
+        fig.tight_layout(pad=0.4, h_pad=0.6)
+        self._live_plot = {
+            "fig": fig,
+            "canvas": canvas,
+            "axes": (("action", 1, ax_action), ("latent", 2, ax_latent)),
+            "lines": lines,
+            "width": width,
+            "height": height,
+            "image": None,
+            "x_spans": [],
+            "last_key": None,
+            "frames_since_render": 0,
+        }
+
+    def _render_live_plot(self) -> None:
+        """Redraw the cached panel image from the episode's C_i series so far,
+        and record each axes' pixel extent so the cursor can be drawn onto the
+        cached image without re-rendering. y-axes start at 0 and grow with the
+        running max (C_i is a non-negative MSE); x-axes stay fixed to the
+        step budget so the lines advance left to right as the episode runs."""
+        lp = self._live_plot
+        assert lp is not None
+        for metric, series_idx, ax in lp["axes"]:
+            y_max = 0.0
+            for depth in self.round_trip_depths:
+                points = [
+                    (s[0], s[series_idx][depth])
+                    for s in self._round_trip_series
+                    if depth in s[series_idx]
+                ]
+                steps = [p[0] for p in points]
+                values = [p[1] for p in points]
+                lp["lines"][(metric, depth)].set_data(steps, values)
+                if values:
+                    y_max = max(y_max, max(values))
+            ax.set_ylim(0, y_max * 1.15 if y_max > 0 else 1)
+        lp["canvas"].draw()
+        image = np.asarray(lp["canvas"].buffer_rgba())[..., :3]
+        rendered_h, rendered_w = image.shape[:2]
+        if (rendered_h, rendered_w) != (lp["height"], lp["width"]):
+            image = cv2.resize(image, (lp["width"], lp["height"]), interpolation=cv2.INTER_AREA)
+        lp["image"] = np.ascontiguousarray(image, dtype=np.uint8)
+        # Axes extents in display pixels (origin bottom-left) -> image rows/cols.
+        scale_x = lp["width"] / rendered_w
+        scale_y = lp["height"] / rendered_h
+        spans = []
+        for _, _, ax in lp["axes"]:
+            bbox = ax.get_window_extent()
+            spans.append(
+                (
+                    bbox.x0 * scale_x,
+                    bbox.x1 * scale_x,
+                    int(round((rendered_h - bbox.y1) * scale_y)),
+                    int(round((rendered_h - bbox.y0) * scale_y)),
+                )
+            )
+        lp["x_spans"] = spans
+
+    def _append_live_plot(self, frame: np.ndarray) -> np.ndarray:
+        """Return ``frame`` with this step's live C_i panel concatenated on
+        its right. The matplotlib panel is only re-rendered when a new C_i
+        value arrives or every _LIVE_PLOT_REDRAW_EVERY frames; in between, the
+        cached image is reused and only the current-step cursor moves."""
+        if self._live_plot is None:
+            self._init_live_plot(frame.shape[0])
+        lp = self._live_plot
+        assert lp is not None
+        if frame.shape[0] != lp["height"]:
+            # Composed frame height is locked per episode (the caption buffer
+            # caches its height), so this should never trigger; guard anyway
+            # rather than letting a mismatched concat raise mid-rollout.
+            raise RuntimeError(
+                f"live plot panel height {lp['height']} != frame height {frame.shape[0]}"
+            )
+        key = (
+            tuple(sorted((self._round_trip_overlay_action or {}).items())),
+            tuple(sorted((self._round_trip_overlay_latent or {}).items())),
+        )
+        if (
+            lp["image"] is None
+            or key != lp["last_key"]
+            or lp["frames_since_render"] >= _LIVE_PLOT_REDRAW_EVERY
+        ):
+            self._render_live_plot()
+            lp["last_key"] = key
+            lp["frames_since_render"] = 0
+        else:
+            lp["frames_since_render"] += 1
+
+        panel = lp["image"].copy()
+        progress = min(max(self.step_count / max(self.max_episode_steps, 1), 0.0), 1.0)
+        for x0, x1, top, bottom in lp["x_spans"]:
+            x = int(round(x0 + progress * (x1 - x0)))
+            cv2.line(panel, (x, top), (x, bottom), _LIVE_PLOT_CURSOR_RGB, 1)
+        return np.concatenate([frame, panel], axis=1)
+
     def _get_video_frames(self, obs: dict) -> list[np.ndarray]:
         if self.record_video_keys is None:
             return [frame for key, frame in obs.items() if key.startswith("video.")]
@@ -493,6 +732,9 @@ class VideoRecordingWrapper(gym.Wrapper):
                 os.rename(self.file_path, new_file_path)
                 if self.round_trip_depths is not None and self._round_trip_series:
                     self._save_round_trip_plot(new_file_path.with_suffix(".png"))
+                    self._save_round_trip_data(
+                        new_file_path.with_suffix(".json"), new_file_path, self.is_success
+                    )
             else:
                 print(
                     f"Skipping video recording for unfinished episode {previous_step_count} / {self.max_episode_steps}"
@@ -508,6 +750,9 @@ class VideoRecordingWrapper(gym.Wrapper):
         self._round_trip_overlay_action = None
         self._round_trip_overlay_latent = None
         self._round_trip_series = []
+        # New episode == new frame-height lock, so the live-plot panel (sized
+        # to the composed frame) is rebuilt on the next recorded frame.
+        self._live_plot = None
 
         if self.video_dir is not None:
             self.file_path = self.video_dir / f"{uuid.uuid4()}.mp4"
@@ -681,6 +926,9 @@ class VideoRecordingWrapper(gym.Wrapper):
                     )
                     y_offset += line_height
                 frame = np.concatenate([frame, caption], axis=0)
+
+            if self.round_trip_live_plot:
+                frame = self._append_live_plot(frame)
 
             self._write_video_frame(frame)
 

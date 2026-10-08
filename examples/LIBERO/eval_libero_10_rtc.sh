@@ -9,8 +9,15 @@
 # client (gr00t/eval/rollout_policy.py) against all 10 LIBERO-10 tasks in
 # sequence. For each task this saves: the rollout videos - each with a
 # C_i(action)/C_i(latent) caption line per depth (Mechanism 2, since
-# --video-dir is set) - and a matching per-episode C_i-vs-step plot
-# (VideoRecordingWrapper._save_round_trip_plot) alongside every kept video; a
+# --video-dir is set), plus a live C_i-vs-step panel rendered side by side
+# with the footage in every frame (ROUND_TRIP_LIVE_PLOT=1, the default; with
+# RAW_VIDEO=1 the videos are the plain camera footage instead, no caption or
+# panel) - and alongside every kept video a matching per-episode C_i-vs-step
+# plot (VideoRecordingWrapper._save_round_trip_plot) plus a <video>.json file
+# with C_i per recorded frame; each task's video folder also gets an
+# index.html viewer that plays the videos next to toggleable, time-synced C_i
+# plots (gr00t/eval/sim/round_trip_viewer.py), and $VIDEO_ROOT/index.html
+# links all tasks' viewers; a
 # JSON dump of the task's `results` return value (env_name, per-episode
 # successes, and episode_infos - including the per-episode
 # round_trip_episode_id used below to attribute C_i to individual episodes,
@@ -72,6 +79,24 @@ SERVER_STARTUP_TIMEOUT="${SERVER_STARTUP_TIMEOUT:-600}"
 ROUND_TRIP_CHECK_INTERVAL="${ROUND_TRIP_CHECK_INTERVAL:-$N_ACTION_STEPS}"
 # shellcheck disable=SC2206
 ROUND_TRIP_DEPTHS=(${ROUND_TRIP_DEPTHS:-1 2 4})
+# 1 = append a live C_i-vs-step panel to the right of every exported video
+# frame (see VideoRecordingWrapper's round_trip_live_plot); 0 = caption lines
+# and the per-episode PNG only.
+ROUND_TRIP_LIVE_PLOT="${ROUND_TRIP_LIVE_PLOT:-1}"
+if [ "$ROUND_TRIP_LIVE_PLOT" = "1" ]; then
+  LIVE_PLOT_FLAG="--round-trip-live-plot"
+else
+  LIVE_PLOT_FLAG="--no-round-trip-live-plot"
+fi
+# 1 = export the plain camera footage (no caption strip, no live C_i panel;
+# overrides ROUND_TRIP_LIVE_PLOT). C_i still goes to each video's .json
+# sidecar and the HTML viewers either way.
+RAW_VIDEO="${RAW_VIDEO:-0}"
+if [ "$RAW_VIDEO" = "1" ]; then
+  RAW_VIDEO_FLAG="--raw-video"
+else
+  RAW_VIDEO_FLAG="--no-raw-video"
+fi
 RTC_DIR="$OUTPUT_ROOT/round_trip_consistency"
 RTC_LOG_PATH="${RTC_LOG_PATH:-$RTC_DIR/$CHECKPOINT_NAME.jsonl}"
 # Skip a task whose result JSON already exists (lets a killed/interrupted run
@@ -196,6 +221,8 @@ for TASK in "${TASKS[@]}"; do
     --enable-round-trip-check \
     --round-trip-check-interval "$ROUND_TRIP_CHECK_INTERVAL" \
     --round-trip-depths "${ROUND_TRIP_DEPTHS[@]}" \
+    "$LIVE_PLOT_FLAG" \
+    "$RAW_VIDEO_FLAG" \
     >"$FULL_LOG" 2>&1
   CLIENT_EXIT=$?
   set -e
@@ -237,6 +264,12 @@ with open(json_path, "w") as f:
 print(f"  -> {n_success}/{n} = {n_success / n:.4f}  (saved {json_path})")
 PY
 done
+
+# ---- C_i HTML viewers -----------------------------------------------------------
+# rollout_policy.py already wrote each task folder's index.html; this rebuilds
+# them with an "All tasks" link and writes the root index linking them all.
+"$CLIENT_PYTHON" gr00t/eval/sim/round_trip_viewer.py "$VIDEO_ROOT" --root \
+  --title "$CHECKPOINT_NAME" || echo "WARNING: failed to build the C_i HTML viewers" >&2
 
 # ---- Aggregate summary --------------------------------------------------------
 python3 - "$RESULTS_DIR" "$SUMMARY_JSON" "${TASKS[@]}" <<'PY'
