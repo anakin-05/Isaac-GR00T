@@ -126,5 +126,6 @@ if __name__ == "__main__":
     config.training.save_only_model = ft_config.save_only_model
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.skip_weight_loading = ft_config.skip_weight_loading
+    config.training.action_head_num_layers = ft_config.action_head_num_layers
 
     run(config)

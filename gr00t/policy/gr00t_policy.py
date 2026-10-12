@@ -20,6 +20,8 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +69,77 @@ def _sim_language_batch_to_sequence(value: Any) -> Any:
     return value
 
 
+def _resolve_processor_dir(model_dir: Path) -> Path:
+    """Training saves processor files under ``processor/``; released checkpoints keep them at the root."""
+    if (model_dir / "processor").is_dir() and not (model_dir / "processor_config.json").exists():
+        return model_dir / "processor"
+    return model_dir
+
+
+def _nested_allclose(a: Any, b: Any) -> bool:
+    if isinstance(a, dict):
+        return (
+            isinstance(b, dict)
+            and a.keys() == b.keys()
+            and all(_nested_allclose(a[k], b[k]) for k in a)
+        )
+    if isinstance(a, (list, tuple)):
+        return (
+            isinstance(b, (list, tuple))
+            and len(a) == len(b)
+            and all(_nested_allclose(x, y) for x, y in zip(a, b))
+        )
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
+    return a == b
+
+
+# Processor settings that change how actions are normalized; an autoguidance guide must
+# match the main model on all of them because guidance mixes normalized velocities.
+_NORMALIZATION_PROCESSOR_KWARGS = (
+    "max_state_dim",
+    "max_action_dim",
+    "max_action_horizon",
+    "use_percentiles",
+    "use_mean_std",
+    "clip_outliers",
+    "use_relative_action",
+    "apply_sincos_state_encoding",
+)
+
+
+def check_autoguidance_processor_compatibility(
+    main_processor_dir: Path, guide_processor_dir: Path, embodiment_tag_value: str
+) -> None:
+    """Raise if the guide normalizes states/actions differently from the main model."""
+
+    def load(processor_dir: Path, name: str) -> Any:
+        path = processor_dir / name
+        if not path.exists():
+            raise FileNotFoundError(f"Autoguidance compatibility check needs {path}")
+        return json.loads(path.read_text())
+
+    mismatches = []
+    main_kwargs = load(main_processor_dir, "processor_config.json").get("processor_kwargs", {})
+    guide_kwargs = load(guide_processor_dir, "processor_config.json").get("processor_kwargs", {})
+    for key in _NORMALIZATION_PROCESSOR_KWARGS:
+        if main_kwargs.get(key) != guide_kwargs.get(key):
+            mismatches.append(
+                f"processor_config.{key}: main={main_kwargs.get(key)!r} "
+                f"guide={guide_kwargs.get(key)!r}"
+            )
+    for name in ("statistics.json", "embodiment_id.json"):
+        main_value = load(main_processor_dir, name).get(embodiment_tag_value)
+        guide_value = load(guide_processor_dir, name).get(embodiment_tag_value)
+        if main_value is None or not _nested_allclose(main_value, guide_value):
+            mismatches.append(f"{name}[{embodiment_tag_value!r}] differs or is missing")
+    if mismatches:
+        raise ValueError(
+            "Autoguidance guide model is not compatible with the main model "
+            f"({main_processor_dir} vs {guide_processor_dir}):\n  " + "\n  ".join(mismatches)
+        )
+
+
 class Gr00tPolicy(BasePolicy):
     """Core policy class for Gr00t model inference.
 
@@ -87,6 +160,8 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        guide_model_path: str | None = None,
+        guidance_scale: float = 1.0,
     ):
         """Initialize the Gr00t Policy.
 
@@ -96,6 +171,11 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            guide_model_path: Optional checkpoint of a weaker model (e.g. a smaller action
+                head trained for fewer steps) used for autoguidance. It must be finetuned
+                from the same base with a frozen backbone and the same normalization.
+            guidance_scale: Autoguidance weight w; actions are sampled with velocity
+                v_guide + w * (v_main - v_guide). 1.0 disables guidance.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -115,12 +195,7 @@ class Gr00tPolicy(BasePolicy):
         # Training saves processor files under a "processor/" subdirectory, but
         # AutoProcessor expects them at the model root.  Fall back to the
         # subdirectory when the root lacks a processor_config.json.
-        processor_dir = (
-            model_dir / "processor"
-            if (model_dir / "processor").is_dir()
-            and not (model_dir / "processor_config.json").exists()
-            else model_dir
-        )
+        processor_dir = _resolve_processor_dir(model_dir)
         self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
         self.processor.eval()
 
@@ -173,6 +248,64 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) >= 1, "At least one language key is required"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+        if guide_model_path is not None:
+            self._attach_autoguidance(
+                Path(guide_model_path), guidance_scale, device=device, processor_dir=processor_dir
+            )
+        elif guidance_scale != 1.0:
+            raise ValueError("guidance_scale != 1.0 requires guide_model_path")
+
+    def _attach_autoguidance(
+        self, guide_dir: Path, guidance_scale: float, *, device: int | str, processor_dir: Path
+    ) -> None:
+        """Load a guide model and attach its action head to ``self.model`` for autoguidance.
+
+        The guide reuses the main model's backbone forward pass, so its backbone weights
+        must be identical (true when both were finetuned from the same base with
+        ``tune_llm=False`` and ``tune_visual=False``).
+        """
+        check_autoguidance_processor_compatibility(
+            processor_dir, _resolve_processor_dir(guide_dir), self.embodiment_tag.value
+        )
+
+        guide = AutoModel.from_pretrained(guide_dir)
+        guide.eval()
+        guide.to(device=device, dtype=torch.bfloat16)
+
+        for key in ("action_horizon", "max_action_dim", "max_state_dim", "state_history_length"):
+            main_value = getattr(self.model.config, key)
+            guide_value = getattr(guide.config, key)
+            if main_value != guide_value:
+                raise ValueError(
+                    f"Guide model config.{key}={guide_value} does not match main model {main_value}"
+                )
+
+        main_backbone = self.model.backbone.state_dict()
+        guide_backbone = guide.backbone.state_dict()
+        mismatched = [
+            k
+            for k in main_backbone
+            if k not in guide_backbone or not torch.equal(main_backbone[k], guide_backbone[k])
+        ]
+        if mismatched or main_backbone.keys() != guide_backbone.keys():
+            raise ValueError(
+                "Guide model backbone differs from the main model backbone, so the backbone "
+                f"forward pass cannot be shared ({len(mismatched)} mismatched tensors, e.g. "
+                f"{mismatched[:3]}). Finetune the guide from the same base with a frozen backbone."
+            )
+
+        guide_head = guide.action_head
+        del guide, guide_backbone
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.model.set_autoguidance(guide_head, guidance_scale)
+        print(
+            f"Autoguidance enabled: guide={guide_dir} "
+            f"(DiT layers={guide_head.config.diffusion_model_cfg['num_layers']}), "
+            f"guidance_scale={guidance_scale}; backbone and normalization checks passed",
+            flush=True,
+        )
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.

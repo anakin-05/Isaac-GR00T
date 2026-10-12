@@ -322,6 +322,61 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         return BatchFeature(data={"backbone_features": vl_embeds, "state_features": state_features})
 
+    def _predict_velocity(
+        self,
+        actions: torch.Tensor,
+        timesteps_tensor: torch.Tensor,
+        state_features: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        backbone_output: BatchFeature,
+    ) -> torch.Tensor:
+        """
+        Predict the flow matching velocity for one denoising step.
+
+        Args:
+            actions: [B, action_horizon, action_dim] current noisy actions
+            timesteps_tensor: [B] discretized timesteps
+            state_features: [B, state_horizon, input_embedding_dim]
+            vl_embeds: [B, seq_len, backbone_embedding_dim] (already passed through vlln)
+            embodiment_id: [B] (embodiment IDs)
+            backbone_output: Output from the backbone model (provides the attention masks)
+
+        Returns:
+            [B, action_horizon, action_dim] predicted velocity
+        """
+        # Embed noised action trajectory.
+        action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+        # Add position embedding.
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(
+                action_features.shape[1], dtype=torch.long, device=action_features.device
+            )
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+
+        # Join vision, language, state and action embedding along sequence dimension.
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+
+        # Run model forward.
+        if self.config.use_alternate_vl_dit:
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                timestep=timesteps_tensor,
+                image_mask=backbone_output.image_mask,
+                backbone_attention_mask=backbone_output.backbone_attention_mask,
+            )
+        else:
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                timestep=timesteps_tensor,
+            )
+        pred = self.action_decoder(model_output, embodiment_id)
+
+        return pred[:, -self.action_horizon :]
+
     @torch.no_grad()
     def get_action_with_features(
         self,
@@ -331,6 +386,9 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output: BatchFeature,
         action_input: BatchFeature,
         options: dict[str, Any] | None = None,
+        guide: "Gr00tN1d7ActionHead | None" = None,
+        guide_features: BatchFeature | None = None,
+        guidance_scale: float = 1.0,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -340,7 +398,14 @@ class Gr00tN1d7ActionHead(nn.Module):
             state_features: [B, state_horizon, input_embedding_dim]
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
+            guide: Optional weaker action head for autoguidance. It must share the
+                backbone (and therefore the attention masks in ``backbone_output``).
+            guide_features: The guide's own ``_encode_features`` output.
+            guidance_scale: Autoguidance weight; 1.0 disables guidance.
         """
+        use_guide = guide is not None and guidance_scale != 1.0
+        if use_guide and guide_features is None:
+            raise ValueError("guide_features is required when guiding with a guide action head")
         vl_embeds = backbone_features
 
         # Set initial actions as the sampled noise.
@@ -402,34 +467,28 @@ class Gr00tN1d7ActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
+            pred_velocity = self._predict_velocity(
+                actions, timesteps_tensor, state_features, vl_embeds, embodiment_id, backbone_output
+            )
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
-
-            # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
+            if use_guide:
+                # Autoguidance (Karras et al. 2024, "Guiding a Diffusion Model with a Bad
+                # Version of Itself"): extrapolate from a weaker version of the model toward
+                # the main model, D = D_guide + w * (D_main - D_guide). For fixed x_t and t the
+                # denoised estimate is affine in the velocity, so the same lerp applies here.
+                guide_velocity = guide._predict_velocity(
+                    actions,
+                    timesteps_tensor,
+                    guide_features.state_features,
+                    guide_features.backbone_features,
+                    embodiment_id,
+                    backbone_output,
                 )
-            else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                pred_velocity = (
+                    guide_velocity.float()
+                    .lerp(pred_velocity.float(), guidance_scale)
+                    .to(pred_velocity.dtype)
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
@@ -448,6 +507,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output: BatchFeature,
         action_input: BatchFeature,
         options: dict[str, Any] | None = None,
+        guide: "Gr00tN1d7ActionHead | None" = None,
+        guidance_scale: float = 1.0,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -459,12 +520,21 @@ class Gr00tN1d7ActionHead(nn.Module):
             action_input: Input containing:
                 - state: [B, state_dim]
                 - embodiment_id: [B] (embodiment IDs)
+            guide: Optional weaker action head sharing this backbone, for autoguidance.
+            guidance_scale: Autoguidance weight; 1.0 disables guidance.
 
         Returns:
             BatchFeature containing:
                 - action_pred: [B, action_horizon, action_dim] predicted actions
         """
+        use_guide = guide is not None and guidance_scale != 1.0
+        # _encode_features applies vlln to backbone_output in place, so the guide gets its
+        # own shallow copy holding the raw backbone features.
+        guide_backbone_output = BatchFeature(data=dict(backbone_output)) if use_guide else None
         features = self._encode_features(backbone_output, action_input)
+        guide_features = (
+            guide._encode_features(guide_backbone_output, action_input) if use_guide else None
+        )
         return self.get_action_with_features(
             backbone_features=features.backbone_features,
             state_features=features.state_features,
@@ -472,6 +542,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             backbone_output=backbone_output,
             action_input=action_input,
             options=options,
+            guide=guide if use_guide else None,
+            guide_features=guide_features,
+            guidance_scale=guidance_scale,
         )
 
     @property
@@ -550,6 +623,24 @@ class Gr00tN1d7(PreTrainedModel):
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
 
+        # Optional autoguidance guide head (inference only, see set_autoguidance).
+        self.autoguidance_head = None
+        self.autoguidance_scale = 1.0
+
+    def set_autoguidance(
+        self, guide_head: Gr00tN1d7ActionHead | None, guidance_scale: float = 1.0
+    ) -> None:
+        """
+        Guide action sampling with a weaker version of this model's action head.
+
+        Implements autoguidance from "Guiding a Diffusion Model with a Bad Version of
+        Itself" (Karras et al., 2024). The guide head must run on this model's backbone
+        features and use the same action normalization. Passing ``None`` or
+        ``guidance_scale == 1.0`` restores unguided sampling.
+        """
+        self.autoguidance_head = guide_head
+        self.autoguidance_scale = float(guidance_scale)
+
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:
         """Prepare inputs for backbone and action head."""
 
@@ -609,7 +700,13 @@ class Gr00tN1d7(PreTrainedModel):
 
         # Forward through backbone
         backbone_outputs = self.backbone(backbone_inputs)
-        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        action_outputs = self.action_head.get_action(
+            backbone_outputs,
+            action_inputs,
+            options,
+            guide=self.autoguidance_head,
+            guidance_scale=self.autoguidance_scale,
+        )
 
         return action_outputs
 

@@ -1,0 +1,38 @@
+{
+    "state": {
+        "left_joint": {
+            "start": 0,
+            "end": 7
+        },
+        "right_joint": {
+            "start": 7,
+            "end": 14
+        }
+    },
+    "action": {
+        "left_joint": {
+            "start": 0,
+            "end": 7
+        },
+        "right_joint": {
+            "start": 7,
+            "end": 14
+        }
+    },
+    "video": {
+        "cam_high": {
+            "original_key": "observation.images.cam_high"
+        },
+        "cam_left_wrist": {
+            "original_key": "observation.images.cam_left_wrist"
+        },
+        "cam_right_wrist": {
+            "original_key": "observation.images.cam_right_wrist"
+        }
+    },
+    "annotation": {
+        "human.action.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}

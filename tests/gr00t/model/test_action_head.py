@@ -153,6 +153,110 @@ class TestActionHeadGetAction:
         assert out["action_pred"].shape[0] == 1
 
 
+def _clone_batch(batch: BatchFeature) -> BatchFeature:
+    # get_action applies vlln to backbone_output in place, so each call needs its own copy.
+    return BatchFeature(data={k: v.clone() for k, v in batch.items()})
+
+
+def _make_head(seed: int, config) -> Gr00tN1d7ActionHead:
+    torch.manual_seed(seed)
+    head = Gr00tN1d7ActionHead(config)
+    # A freshly initialized LayerNorm is (nearly) idempotent, which would hide vlln being
+    # applied twice to the shared backbone output; randomize its affine parameters.
+    with torch.no_grad():
+        head.vlln.weight.uniform_(0.5, 2.0)
+        head.vlln.bias.normal_()
+    head.eval()
+    return head
+
+
+class TestActionHeadAutoguidance:
+    """Test autoguidance: v = v_guide + w * (v_main - v_guide) in the denoising loop."""
+
+    def _sample(self, head, backbone_output, action_input, guide=None, guidance_scale=1.0):
+        torch.manual_seed(1234)
+        return head.get_action(
+            _clone_batch(backbone_output),
+            action_input,
+            guide=guide,
+            guidance_scale=guidance_scale,
+        )["action_pred"]
+
+    def _inputs(self, config):
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        return _make_backbone_output(config), action_input
+
+    def test_scale_one_matches_unguided(self):
+        config = _small_config()
+        head, guide = _make_head(0, config), _make_head(1, config)
+        backbone_output, action_input = self._inputs(config)
+        unguided = self._sample(head, backbone_output, action_input)
+        guided = self._sample(head, backbone_output, action_input, guide, guidance_scale=1.0)
+        assert torch.equal(unguided, guided)
+
+    def test_identical_guide_matches_unguided(self):
+        config = _small_config()
+        head = _make_head(0, config)
+        guide = _make_head(0, config)
+        backbone_output, action_input = self._inputs(config)
+        unguided = self._sample(head, backbone_output, action_input)
+        guided = self._sample(head, backbone_output, action_input, guide, guidance_scale=3.0)
+        torch.testing.assert_close(guided, unguided, rtol=1e-5, atol=1e-5)
+
+    def test_guided_matches_manual_rollout(self):
+        config = _small_config()
+        head, guide = _make_head(0, config), _make_head(1, config)
+        backbone_output, action_input = self._inputs(config)
+        w = 2.0
+        guided = self._sample(head, backbone_output, action_input, guide, guidance_scale=w)
+
+        main_feats = head._encode_features(_clone_batch(backbone_output), action_input)
+        guide_feats = guide._encode_features(_clone_batch(backbone_output), action_input)
+        batch_size = action_input["state"].shape[0]
+        torch.manual_seed(1234)
+        actions = torch.randn(batch_size, config.action_horizon, config.max_action_dim)
+        n = config.num_inference_timesteps
+        for step in range(n):
+            t = torch.full((batch_size,), int(step / n * config.num_timestep_buckets))
+            embodiment_id = action_input["embodiment_id"]
+            v_main = head._predict_velocity(
+                actions,
+                t,
+                main_feats.state_features,
+                main_feats.backbone_features,
+                embodiment_id,
+                backbone_output,
+            )
+            v_guide = guide._predict_velocity(
+                actions,
+                t,
+                guide_feats.state_features,
+                guide_feats.backbone_features,
+                embodiment_id,
+                backbone_output,
+            )
+            actions = actions + (v_guide + w * (v_main - v_guide)) / n
+
+        torch.testing.assert_close(guided, actions, rtol=1e-5, atol=1e-5)
+        unguided = self._sample(head, backbone_output, action_input)
+        assert not torch.allclose(guided, unguided, atol=1e-3)
+
+    def test_guided_with_alternate_vl_dit(self):
+        dit_cfg = dict(_small_config().diffusion_model_cfg, num_layers=4)
+        config = _small_config(use_alternate_vl_dit=True, diffusion_model_cfg=dit_cfg)
+        head, guide = _make_head(0, config), _make_head(1, config)
+        backbone_output, action_input = self._inputs(config)
+        backbone_output["image_mask"][:, ::2] = False  # half text tokens, half image tokens
+        # The real backbone returns a bool mask (attention_mask == 1).
+        backbone_output["backbone_attention_mask"] = backbone_output[
+            "backbone_attention_mask"
+        ].bool()
+        guided = self._sample(head, backbone_output, action_input, guide, guidance_scale=2.0)
+        assert guided.shape == (2, config.action_horizon, config.max_action_dim)
+        assert torch.isfinite(guided).all()
+
+
 class TestActionHeadEncodeFeatures:
     """Test feature encoding helper."""
 

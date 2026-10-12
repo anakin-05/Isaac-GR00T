@@ -64,6 +64,13 @@ class ServerConfig:
     device: str = "cuda"
     """Device to run the model on"""
 
+    guide_model_path: str | None = None
+    """Optional checkpoint of a weaker guide model for autoguidance (Karras et al. 2024),
+    e.g. a smaller action head finetuned for fewer steps from the same base model."""
+
+    guidance_scale: float = 1.0
+    """Autoguidance weight w: velocity = v_guide + w * (v_main - v_guide). 1.0 disables guidance."""
+
     # Replay policy configs
     dataset_path: str | None = None
     """Path to the dataset for replay trajectory"""
@@ -94,6 +101,9 @@ def main(config: ServerConfig):
     print(f"  Embodiment tag: {config.embodiment_tag}")
     print(f"  Model path: {config.model_path}")
     print(f"  Device: {config.device}")
+    if config.guide_model_path is not None:
+        print(f"  Guide model path: {config.guide_model_path}")
+        print(f"  Guidance scale: {config.guidance_scale}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
 
@@ -102,11 +112,15 @@ def main(config: ServerConfig):
         # check if the model path exists
         if config.model_path.startswith("/") and not os.path.exists(config.model_path):
             raise FileNotFoundError(f"Model path {config.model_path} does not exist")
+        if config.guide_model_path is not None and not os.path.exists(config.guide_model_path):
+            raise FileNotFoundError(f"Guide model path {config.guide_model_path} does not exist")
         policy = Gr00tPolicy(
             embodiment_tag=config.embodiment_tag,
             model_path=config.model_path,
             device=config.device,
             strict=config.strict,
+            guide_model_path=config.guide_model_path,
+            guidance_scale=config.guidance_scale,
         )
     elif config.dataset_path is not None:
         if config.execution_horizon is None:

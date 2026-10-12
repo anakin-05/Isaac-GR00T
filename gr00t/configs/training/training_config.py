@@ -56,6 +56,8 @@ class TrainingConfig:
 
     start_from_checkpoint: Optional[str] = None
     skip_weight_loading: bool = False  # skip loading checkpoint weights (architecture only)
+    # Keep only the first N action-head DiT blocks of start_from_checkpoint (autoguidance guide).
+    action_head_num_layers: Optional[int] = None
 
     # Mixed precision
     tf32: bool = True

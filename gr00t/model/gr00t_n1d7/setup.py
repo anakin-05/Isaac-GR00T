@@ -16,10 +16,11 @@
 import json
 import logging
 from pathlib import Path
+import re
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
@@ -42,6 +43,37 @@ def convert_tensors_to_lists(obj):
         return [convert_tensors_to_lists(item) for item in obj]
     else:
         return obj
+
+
+_DIT_BLOCK_KEY = re.compile(r"^action_head\.model\.transformer_blocks\.(\d+)\.")
+
+
+def truncated_diffusion_model_cfg(diffusion_model_cfg: dict, num_layers: int) -> dict:
+    """Return ``diffusion_model_cfg`` with the DiT cut down to its first ``num_layers`` blocks.
+
+    Used to build the smaller guide model for autoguidance. The block count must be a
+    multiple of 4 so AlternateVLDiT keeps its text-cross / self / image-cross / self cycle
+    (with fewer blocks, image tokens may never be attended to).
+    """
+    base_num_layers = diffusion_model_cfg["num_layers"]
+    if not 0 < num_layers <= base_num_layers:
+        raise ValueError(
+            f"action_head_num_layers={num_layers} must be in [1, {base_num_layers}] "
+            "(the checkpoint's DiT depth)"
+        )
+    if num_layers % 4 != 0:
+        raise ValueError(f"action_head_num_layers={num_layers} must be a multiple of 4")
+    return {**diffusion_model_cfg, "num_layers": num_layers}
+
+
+def drop_truncated_dit_block_keys(unexpected_keys: list[str], num_layers: int) -> list[str]:
+    """Remove checkpoint keys of the DiT blocks discarded by ``truncated_diffusion_model_cfg``."""
+    kept = []
+    for key in unexpected_keys:
+        match = _DIT_BLOCK_KEY.match(key)
+        if match is None or int(match.group(1)) < num_layers:
+            kept.append(key)
+    return kept
 
 
 class Gr00tN1d7Pipeline(ModelPipeline):
@@ -78,7 +110,21 @@ class Gr00tN1d7Pipeline(ModelPipeline):
     def _create_model(self):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
+        action_head_num_layers = getattr(self.config.training, "action_head_num_layers", None)
         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
+            model_overrides = {}
+            if action_head_num_layers is not None:
+                base_config = AutoConfig.from_pretrained(
+                    self.config.training.start_from_checkpoint, **self.transformers_loading_kwargs
+                )
+                model_overrides["diffusion_model_cfg"] = truncated_diffusion_model_cfg(
+                    base_config.diffusion_model_cfg, action_head_num_layers
+                )
+                logging.info(
+                    "Truncating action head DiT from %d to %d blocks",
+                    base_config.diffusion_model_cfg["num_layers"],
+                    action_head_num_layers,
+                )
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
@@ -91,6 +137,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
+                **model_overrides,
                 **self.transformers_loading_kwargs,
             )
 
@@ -104,6 +151,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 logging.info("mask_token not in checkpoint - initialized")
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
+            if action_head_num_layers is not None:
+                unexpected_keys = drop_truncated_dit_block_keys(
+                    unexpected_keys, action_head_num_layers
+                )
             mismatched_keys = loading_info.get("mismatched_keys", [])
             other_missing = [k for k in missing_keys if "mask_token" not in k]
             errors = []
@@ -120,6 +171,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 )
 
         else:
+            if action_head_num_layers is not None:
+                self.config.model.diffusion_model_cfg = truncated_diffusion_model_cfg(
+                    self.config.model.diffusion_model_cfg, action_head_num_layers
+                )
             model = self.model_class(
                 self.config.model,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,

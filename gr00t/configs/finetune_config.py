@@ -196,6 +196,12 @@ class FinetuneConfig:
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
+    action_head_num_layers: int | None = None
+    """If set, build the action head DiT with only this many transformer blocks, initialized
+    from the first blocks of ``base_model_path`` (all other weights load unchanged). Used to
+    train a smaller "bad version" guide model for autoguidance; see
+    ``examples/LIBERO/AUTOGUIDANCE.md``. Must be a multiple of 4."""
+
     def __post_init__(self) -> None:
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
