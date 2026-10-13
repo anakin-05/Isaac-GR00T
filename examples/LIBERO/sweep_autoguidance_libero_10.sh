@@ -11,6 +11,9 @@
 #   GUIDE_RUN_DIR=examples/LIBERO/logs/libero-rtc/<guide-run> \
 #     bash examples/LIBERO/sweep_autoguidance_libero_10.sh
 #
+# Set ACG_SKIP_BLOCKS (e.g. "15 19 23") to also sweep Action Coherence Guidance over the same
+# SCALES (no guide model needed; GUIDE_RUN_DIR may then be left unset to run only ACG).
+#
 # Any eval_libero_10.sh setting (MODEL_PATH, N_ENVS, PORT, ...) can be
 # overridden through the environment as well. See AUTOGUIDANCE.md.
 
@@ -20,10 +23,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-GUIDE_RUN_DIR="${GUIDE_RUN_DIR:?set GUIDE_RUN_DIR to the training output dir of the guide model}"
-GUIDE_LABEL="${GUIDE_LABEL:-autoguidance-dit8}"
-# shellcheck disable=SC2206
-GUIDE_STEPS=(${GUIDE_STEPS:-2000 5000 10000})
+ACG_SKIP_BLOCKS="${ACG_SKIP_BLOCKS:-}"
+if [ -z "$ACG_SKIP_BLOCKS" ]; then
+  GUIDE_RUN_DIR="${GUIDE_RUN_DIR:?set GUIDE_RUN_DIR to the training output dir of the guide model}"
+fi
+GUIDE_RUN_DIR="${GUIDE_RUN_DIR:-}"
+GUIDE_LABEL="${GUIDE_LABEL:-$([ -n "$GUIDE_RUN_DIR" ] && echo autoguidance-dit8 || echo acg)}"
+if [ -n "$GUIDE_RUN_DIR" ]; then
+  # shellcheck disable=SC2206
+  GUIDE_STEPS=(${GUIDE_STEPS:-2000 5000 10000})
+else
+  GUIDE_STEPS=()
+fi
 # shellcheck disable=SC2206
 SCALES=(${SCALES:-1.5 2.0 3.0})
 INCLUDE_CONTROL="${INCLUDE_CONTROL:-1}"
@@ -43,10 +54,18 @@ run_eval() {
 
 if [ "$INCLUDE_CONTROL" = "1" ]; then
   run_eval "gr00t-n17_baseline_libero-panda_libero-10_n${N_EPISODES}-seed${SEED}" \
-    GUIDE_MODEL_PATH= GUIDANCE_SCALE=1.0
+    GUIDANCE_METHOD= GUIDE_MODEL_PATH= GUIDANCE_SCALE=1.0
 fi
 
-for STEP in "${GUIDE_STEPS[@]}"; do
+if [ -n "$ACG_SKIP_BLOCKS" ]; then
+  BLOCK_TAG="blocks$(echo "$ACG_SKIP_BLOCKS" | tr ' ' '-')"
+  for W in "${SCALES[@]}"; do
+    run_eval "gr00t-n17_acg-${BLOCK_TAG}-w${W}_libero-panda_libero-10_n${N_EPISODES}-seed${SEED}" \
+      GUIDANCE_METHOD=acg GUIDE_MODEL_PATH= GUIDANCE_SCALE="$W" ACG_SKIP_BLOCKS="$ACG_SKIP_BLOCKS"
+  done
+fi
+
+for STEP in ${GUIDE_STEPS[@]+"${GUIDE_STEPS[@]}"}; do
   GUIDE_CKPT="$GUIDE_RUN_DIR/checkpoint-$STEP"
   if [ ! -d "$GUIDE_CKPT" ]; then
     echo "ERROR: $GUIDE_CKPT not found" >&2
@@ -54,7 +73,7 @@ for STEP in "${GUIDE_STEPS[@]}"; do
   fi
   for W in "${SCALES[@]}"; do
     run_eval "gr00t-n17_${GUIDE_LABEL}-step${STEP}-w${W}_libero-panda_libero-10_n${N_EPISODES}-seed${SEED}" \
-      GUIDE_MODEL_PATH="$GUIDE_CKPT" GUIDANCE_SCALE="$W"
+      GUIDANCE_METHOD= GUIDE_MODEL_PATH="$GUIDE_CKPT" GUIDANCE_SCALE="$W"
   done
 done
 
@@ -72,7 +91,9 @@ for name in run_names:
     rows.append(
         {
             "run_name": name,
+            "guidance_method": config.get("guidance_method"),
             "guide_model_path": config["guide_model_path"],
+            "acg_skip_blocks": config.get("acg_skip_blocks"),
             "guidance_scale": config["guidance_scale"],
             "n_success": summary["overall_n_success"],
             "n_episodes": summary["overall_n_episodes"],

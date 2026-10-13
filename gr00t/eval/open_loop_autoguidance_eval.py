@@ -48,6 +48,7 @@ from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import MessageType
 from gr00t.data.utils import parse_observation_gr00t
+from gr00t.model.modules.acg import validate_acg_blocks
 from gr00t.policy.gr00t_policy import Gr00tPolicy, _rec_to_dtype, _resolve_processor_dir
 import numpy as np
 from omegaconf import OmegaConf
@@ -78,6 +79,11 @@ class ArgsConfig:
 
     scales: list[float] = field(default_factory=lambda: [1.1, 1.5, 2.0, 2.5, 3.0])
     """Guidance weights w. w=1 is the unguided main model and is always evaluated."""
+
+    acg_skip_blocks: list[int] | None = None
+    """Also evaluate Action Coherence Guidance (config ``acg_w<w>`` for every w in --scales):
+    self-attention (odd) DiT blocks whose attention map is replaced by identity for the bad
+    prediction. Needs no guide model and can be combined with --guide-steps."""
 
     include_guide_only: bool = True
     """Also evaluate each guide alone (w=0), to show how much worse the 'bad version' is."""
@@ -114,7 +120,9 @@ def infer_dataset_path(model_path: str) -> str:
     return OmegaConf.load(conf).data.datasets[0].dataset_paths[0]
 
 
-def config_name(guide_step: int | None, scale: float) -> str:
+def config_name(guide_step: int | None, scale: float, acg: bool = False) -> str:
+    if acg:
+        return f"acg_w{scale:g}"
     return MAIN if guide_step is None else f"guide{guide_step}_w{scale:g}"
 
 
@@ -273,6 +281,11 @@ def main(args: ArgsConfig) -> None:
         )
         guides[step] = model.autoguidance_head
     model.set_autoguidance(None, 1.0)
+    acg_blocks = None
+    if args.acg_skip_blocks is not None:
+        acg_blocks = validate_acg_blocks(
+            args.acg_skip_blocks, model.action_head.model.config.num_layers
+        )
 
     loader = LeRobotEpisodeLoader(
         dataset_path=dataset_path, modality_configs=policy.get_modality_config()
@@ -287,13 +300,18 @@ def main(args: ArgsConfig) -> None:
         raise ValueError(f"traj ids {bad} out of range for a dataset with {len(loader)} episodes")
 
     # Configurations: unguided main, then per guide the guide alone and every w != 1.
-    configs: list[tuple[str, int | None, float]] = [(MAIN, None, 1.0)]
+    # (name, guide step, w, ACG blocks); ACG configs perturb the main model itself.
+    configs: list[tuple[str, int | None, float, list[int] | None]] = [(MAIN, None, 1.0, None)]
     for step in args.guide_steps:
         if args.include_guide_only:
-            configs.append((config_name(step, 0.0), step, 0.0))
+            configs.append((config_name(step, 0.0), step, 0.0, None))
         for w in args.scales:
             if w != 1.0:  # identical to the main model
-                configs.append((config_name(step, w), step, w))
+                configs.append((config_name(step, w), step, w, None))
+    if acg_blocks is not None:
+        for w in args.scales:
+            if w != 1.0:
+                configs.append((config_name(None, w, acg=True), None, w, acg_blocks))
 
     (out_dir / "eval_config.json").write_text(
         json.dumps(
@@ -335,7 +353,7 @@ def main(args: ArgsConfig) -> None:
             backbone_inputs, action_inputs = model.prepare_input(collated["inputs"])
             backbone_out = model.backbone(backbone_inputs)  # shared by every configuration
             main_pred = None
-            for name, step, w in configs:
+            for name, step, w, blocks in configs:
                 torch.manual_seed(args.seed + batch_index)  # same noise for every configuration
                 # get_action overwrites backbone_features in place (vlln), so pass a copy.
                 out = model.action_head.get_action(
@@ -343,6 +361,7 @@ def main(args: ArgsConfig) -> None:
                     action_inputs,
                     guide=None if step is None else guides[step],
                     guidance_scale=w,
+                    acg_blocks=blocks,
                 )
                 pred = decode(out["action_pred"])
                 if name == MAIN:
@@ -409,7 +428,7 @@ def main(args: ArgsConfig) -> None:
         for name, parts in results.items()
     }
     rows = []
-    for name, _, _ in configs:
+    for name, *_ in configs:
         summary = summarize(name, merged[name], merged[MAIN], meta["traj_id"], action_keys)
         save_config_results(out_dir, name, merged[name], meta, summary)
         rows.append(summary)

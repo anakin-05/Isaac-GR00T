@@ -20,6 +20,11 @@
 #   GUIDE_MODEL_PATH=examples/LIBERO/logs/libero-rtc/<guide-run>/checkpoint-5000 \
 #   GUIDANCE_SCALE=2.0 bash examples/LIBERO/eval_libero_10.sh
 #
+# Action Coherence Guidance (ACG, training-free; identity attention in some DiT self-attention
+# blocks forms the bad prediction, needs no guide model):
+#   GUIDANCE_METHOD=acg GUIDANCE_SCALE=3.0 ACG_SKIP_BLOCKS="15 19 23" \
+#     bash examples/LIBERO/eval_libero_10.sh
+#
 # Output goes to examples/LIBERO/logs/eval_results/$RUN_NAME, where RUN_NAME
 # encodes the method, guidance scale, episode count and seed, so runs with
 # different settings never share (or SKIP_EXISTING-skip) each other's results.
@@ -38,6 +43,11 @@ MODEL_PATH="${MODEL_PATH:-/mnt/data/sftp/data/duydt6/workspace/diffusion/Isaac-G
 # Autoguidance guide checkpoint (empty = no guidance) and weight w.
 GUIDE_MODEL_PATH="${GUIDE_MODEL_PATH:-}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
+# "acg" switches to Action Coherence Guidance (no guide model; uses GUIDANCE_SCALE and
+# ACG_SKIP_BLOCKS, the self-attention (odd) DiT blocks to perturb). Empty = autoguidance
+# when GUIDE_MODEL_PATH is set, otherwise no guidance.
+GUIDANCE_METHOD="${GUIDANCE_METHOD:-}"
+ACG_SKIP_BLOCKS="${ACG_SKIP_BLOCKS:-15 19 23}"
 EMBODIMENT_TAG="${EMBODIMENT_TAG:-LIBERO_PANDA}"
 N_EPISODES="${N_EPISODES:-50}"
 SEED="${SEED:-42}"
@@ -47,7 +57,9 @@ MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-720}"
 PORT="${PORT:-5556}"
 MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
 HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
-if [ -n "$GUIDE_MODEL_PATH" ]; then
+if [ "$GUIDANCE_METHOD" = "acg" ]; then
+  METHOD="acg-blocks$(echo "$ACG_SKIP_BLOCKS" | tr ' ' '-')-w${GUIDANCE_SCALE}"
+elif [ -n "$GUIDE_MODEL_PATH" ]; then
   METHOD="autoguidance-${GUIDE_TAG:-$(basename "$GUIDE_MODEL_PATH")}-w${GUIDANCE_SCALE}"
 else
   METHOD="$(basename "$MODEL_PATH")"
@@ -94,14 +106,25 @@ if [ ! -d "$MODEL_PATH" ]; then
   exit 1
 fi
 GUIDE_ARGS=()
-if [ -n "$GUIDE_MODEL_PATH" ]; then
+if [ "$GUIDANCE_METHOD" = "acg" ]; then
+  if [ -n "$GUIDE_MODEL_PATH" ]; then
+    echo "ERROR: GUIDANCE_METHOD=acg does not use GUIDE_MODEL_PATH" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2206
+  ACG_BLOCK_LIST=($ACG_SKIP_BLOCKS)
+  GUIDE_ARGS=(--guidance-method acg --guidance-scale "$GUIDANCE_SCALE" --acg-skip-blocks "${ACG_BLOCK_LIST[@]}")
+elif [ -n "$GUIDANCE_METHOD" ] && [ "$GUIDANCE_METHOD" != "autoguidance" ]; then
+  echo "ERROR: unknown GUIDANCE_METHOD=$GUIDANCE_METHOD (use acg or autoguidance)" >&2
+  exit 1
+elif [ -n "$GUIDE_MODEL_PATH" ]; then
   if [ ! -d "$GUIDE_MODEL_PATH" ]; then
     echo "ERROR: guide checkpoint not found at $GUIDE_MODEL_PATH" >&2
     exit 1
   fi
   GUIDE_ARGS=(--guide-model-path "$GUIDE_MODEL_PATH" --guidance-scale "$GUIDANCE_SCALE")
 elif [ "$GUIDANCE_SCALE" != "1.0" ] && [ "$GUIDANCE_SCALE" != "1" ]; then
-  echo "ERROR: GUIDANCE_SCALE=$GUIDANCE_SCALE requires GUIDE_MODEL_PATH" >&2
+  echo "ERROR: GUIDANCE_SCALE=$GUIDANCE_SCALE requires GUIDE_MODEL_PATH or GUIDANCE_METHOD=acg" >&2
   exit 1
 fi
 if [ ! -x "$CLIENT_PYTHON" ]; then
@@ -115,15 +138,17 @@ mkdir -p "$VIDEO_ROOT" "$RESULTS_DIR" "$LOGS_DIR"
 
 # Record what was evaluated next to the results.
 python3 - "$OUTPUT_ROOT/eval_config.json" "$MODEL_PATH" "$GUIDE_MODEL_PATH" "$GUIDANCE_SCALE" \
-  "$N_EPISODES" "$SEED" "$N_ENVS" "$N_ACTION_STEPS" "$MAX_EPISODE_STEPS" <<'PY'
+  "${GUIDANCE_METHOD:-}" "$ACG_SKIP_BLOCKS" "$N_EPISODES" "$SEED" "$N_ENVS" "$N_ACTION_STEPS" "$MAX_EPISODE_STEPS" <<'PY'
 import json
 import sys
 
-path, model, guide, scale, n_episodes, seed, n_envs, n_action_steps, max_steps = sys.argv[1:]
+path, model, guide, scale, method, acg_blocks, n_episodes, seed, n_envs, n_action_steps, max_steps = sys.argv[1:]
 config = {
     "model_path": model,
     "guide_model_path": guide or None,
     "guidance_scale": float(scale),
+    "guidance_method": method or ("autoguidance" if guide else None),
+    "acg_skip_blocks": [int(b) for b in acg_blocks.split()] if method == "acg" else None,
     "n_episodes": int(n_episodes),
     "seed": int(seed),
     "n_envs": int(n_envs),
@@ -136,7 +161,7 @@ PY
 
 # ---- Start the inference server ----------------------------------------------
 SERVER_LOG="$LOGS_DIR/server.log"
-echo "Starting GR00T server (model: $MODEL_PATH, guide: ${GUIDE_MODEL_PATH:-none}, w: $GUIDANCE_SCALE, port: $PORT) -> $SERVER_LOG"
+echo "Starting GR00T server (model: $MODEL_PATH, guide: ${GUIDE_MODEL_PATH:-none}, method: ${GUIDANCE_METHOD:-default}, w: $GUIDANCE_SCALE, port: $PORT) -> $SERVER_LOG"
 HF_HUB_DISABLE_XET="$HF_HUB_DISABLE_XET" setsid uv run python gr00t/eval/run_gr00t_server.py \
   --model-path "$MODEL_PATH" \
   --embodiment-tag "$EMBODIMENT_TAG" \

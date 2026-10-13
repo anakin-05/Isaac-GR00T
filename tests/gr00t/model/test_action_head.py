@@ -24,6 +24,7 @@ import math
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
+from gr00t.model.modules.acg import IdentityAttnProcessor, acg_perturbation, validate_acg_blocks
 import pytest
 import torch
 from transformers.feature_extraction_utils import BatchFeature
@@ -255,6 +256,117 @@ class TestActionHeadAutoguidance:
         guided = self._sample(head, backbone_output, action_input, guide, guidance_scale=2.0)
         assert guided.shape == (2, config.action_horizon, config.max_action_dim)
         assert torch.isfinite(guided).all()
+
+
+class TestActionHeadACG:
+    """Test Action Coherence Guidance: identity self-attention gives the bad prediction."""
+
+    BLOCKS = [1, 3]
+
+    def _config(self):
+        dit_cfg = dict(_small_config().diffusion_model_cfg, num_layers=4)
+        return _small_config(diffusion_model_cfg=dit_cfg)
+
+    def _sample(self, head, backbone_output, action_input, acg_blocks=None, guidance_scale=1.0):
+        torch.manual_seed(1234)
+        return head.get_action(
+            _clone_batch(backbone_output),
+            action_input,
+            guidance_scale=guidance_scale,
+            acg_blocks=acg_blocks,
+        )["action_pred"]
+
+    def _inputs(self, config):
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        return _make_backbone_output(config), action_input
+
+    def test_identity_processor_ignores_attention_map(self):
+        head = _make_head(0, self._config())
+        attn = head.model.transformer_blocks[1].attn1
+        x = torch.randn(2, 5, attn.query_dim)
+        with acg_perturbation(head.model, [1]):
+            out = attn(x)
+            # Each token only sees itself: permuting the other tokens changes nothing.
+            permuted = attn(torch.cat([x[:, :1], x[:, 1:].flip(1)], dim=1))
+        torch.testing.assert_close(out[:, 0], permuted[:, 0])
+        torch.testing.assert_close(out, attn.to_out[0](attn.to_v(x)))
+
+    def test_processors_restored(self):
+        head = _make_head(0, self._config())
+        before = [type(b.attn1.processor) for b in head.model.transformer_blocks]
+        with pytest.raises(RuntimeError):
+            with acg_perturbation(head.model, self.BLOCKS):
+                assert isinstance(
+                    head.model.transformer_blocks[1].attn1.processor, IdentityAttnProcessor
+                )
+                raise RuntimeError
+        assert [type(b.attn1.processor) for b in head.model.transformer_blocks] == before
+
+    def test_scale_one_matches_unguided(self):
+        config = self._config()
+        head = _make_head(0, config)
+        backbone_output, action_input = self._inputs(config)
+        unguided = self._sample(head, backbone_output, action_input)
+        guided = self._sample(head, backbone_output, action_input, self.BLOCKS, 1.0)
+        assert torch.equal(unguided, guided)
+
+    def test_guided_matches_manual_rollout(self):
+        config = self._config()
+        head = _make_head(0, config)
+        backbone_output, action_input = self._inputs(config)
+        w = 2.0
+        guided = self._sample(head, backbone_output, action_input, self.BLOCKS, w)
+
+        feats = head._encode_features(_clone_batch(backbone_output), action_input)
+        batch_size = action_input["state"].shape[0]
+        torch.manual_seed(1234)
+        actions = torch.randn(batch_size, config.action_horizon, config.max_action_dim)
+        n = config.num_inference_timesteps
+        for step in range(n):
+            t = torch.full((batch_size,), int(step / n * config.num_timestep_buckets))
+            args = (
+                actions,
+                t,
+                feats.state_features,
+                feats.backbone_features,
+                action_input["embodiment_id"],
+                backbone_output,
+            )
+            v_main = head._predict_velocity(*args)
+            v_bad = head._predict_velocity(*args, acg_blocks=self.BLOCKS)
+            assert not torch.allclose(v_main, v_bad, atol=1e-4)
+            actions = actions + (v_bad + w * (v_main - v_bad)) / n
+
+        torch.testing.assert_close(guided, actions, rtol=1e-5, atol=1e-5)
+
+    def test_alternate_vl_dit(self):
+        dit_cfg = dict(_small_config().diffusion_model_cfg, num_layers=4)
+        config = _small_config(use_alternate_vl_dit=True, diffusion_model_cfg=dit_cfg)
+        head = _make_head(0, config)
+        backbone_output, action_input = self._inputs(config)
+        backbone_output["image_mask"][:, ::2] = False
+        backbone_output["backbone_attention_mask"] = backbone_output[
+            "backbone_attention_mask"
+        ].bool()
+        guided = self._sample(head, backbone_output, action_input, self.BLOCKS, 2.0)
+        assert torch.isfinite(guided).all()
+
+    def test_validate_blocks(self):
+        assert validate_acg_blocks([19, 15, 15], 32) == [15, 19]
+        for bad in ([], [14], [33], [-1]):
+            with pytest.raises(ValueError):
+                validate_acg_blocks(bad, 32)
+
+    def test_set_acg_conflicts_with_autoguidance(self):
+        from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
+
+        model = Gr00tN1d7.__new__(Gr00tN1d7)
+        torch.nn.Module.__init__(model)
+        model.autoguidance_head = object()
+        model.acg_blocks = None
+        with pytest.raises(ValueError):
+            model.set_acg([1], 2.0)
 
 
 class TestActionHeadEncodeFeatures:

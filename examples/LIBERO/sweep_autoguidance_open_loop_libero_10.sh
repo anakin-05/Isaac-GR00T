@@ -27,6 +27,8 @@
 #   STRIDE                    step between chunks (default: the action horizon)
 #   MAX_STEPS_PER_TRAJ        only evaluate chunks starting before this step (default: all)
 #   BATCH_SIZE, SEED          sampling batch size / noise seed (defaults 16 / 0)
+#   ACG_SKIP_BLOCKS           also evaluate Action Coherence Guidance (config acg_w<w> for each of
+#                             SCALES, no guide model needed), e.g. "15 19 23"; unset = skip
 #   INCLUDE_GUIDE_ONLY        1 also evaluates each guide alone (default 1)
 #   RUN_NAME, OUTPUT_ROOT     output location (default: eval_results/open-loop_<label>_seed<SEED>)
 #   SKIP_EXISTING             1 skips a finished run (default 1)
@@ -45,7 +47,7 @@ if [ -n "$GUIDE_RUN_DIR" ]; then
   GUIDE_LABEL="${GUIDE_LABEL:-autoguidance}"
   GUIDE_STEPS="${GUIDE_STEPS:-2000 5000 10000}"
 else
-  GUIDE_LABEL="${GUIDE_LABEL:-baseline}"
+  GUIDE_LABEL="${GUIDE_LABEL:-$([ -n "${ACG_SKIP_BLOCKS:-}" ] && echo acg || echo baseline)}"
   GUIDE_STEPS=""
 fi
 SCALES="${SCALES:-1.1 1.5 2.0 2.5 3.0}"
@@ -85,6 +87,11 @@ ARGS=(
   --scales "${SCALE_LIST[@]}"
 )
 [ -z "$GUIDE_RUN_DIR" ] || ARGS+=(--guide-run-dir "$GUIDE_RUN_DIR" --guide-steps "${STEPS[@]}")
+if [ -n "${ACG_SKIP_BLOCKS:-}" ]; then
+  # shellcheck disable=SC2206
+  ACG_LIST=($ACG_SKIP_BLOCKS)
+  ARGS+=(--acg-skip-blocks "${ACG_LIST[@]}")
+fi
 [ "$INCLUDE_GUIDE_ONLY" = "1" ] || ARGS+=(--no-include-guide-only)
 [ "$SKIP_EXISTING" = "1" ] || ARGS+=(--no-skip-existing)
 [ -z "${DATASET_PATH:-}" ] || ARGS+=(--dataset-path "$DATASET_PATH")

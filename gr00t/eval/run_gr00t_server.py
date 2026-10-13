@@ -13,15 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib
 import json
 import os
 from pathlib import Path
 import sys
+from typing import Literal
 
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
+from gr00t.model.modules.acg import DEFAULT_ACG_SKIP_BLOCKS
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.replay_policy import ReplayPolicy
 from gr00t.policy.server_client import PolicyServer
@@ -69,7 +71,16 @@ class ServerConfig:
     e.g. a smaller action head finetuned for fewer steps from the same base model."""
 
     guidance_scale: float = 1.0
-    """Autoguidance weight w: velocity = v_guide + w * (v_main - v_guide). 1.0 disables guidance."""
+    """Guidance weight w: velocity = v_bad + w * (v_main - v_bad), where v_bad comes from the guide
+    model (autoguidance) or the attention-perturbed model (ACG). 1.0 disables guidance."""
+
+    guidance_method: Literal["autoguidance", "acg"] | None = None
+    """Guidance method. Default: autoguidance if --guide-model-path is set, otherwise none.
+    "acg" is Action Coherence Guidance (Park & Kim et al., 2026): training-free, the bad prediction
+    uses identity attention in --acg-skip-blocks."""
+
+    acg_skip_blocks: list[int] = field(default_factory=lambda: list(DEFAULT_ACG_SKIP_BLOCKS))
+    """ACG only: self-attention (odd-index) DiT blocks whose attention map is replaced by identity."""
 
     # Replay policy configs
     dataset_path: str | None = None
@@ -101,9 +112,24 @@ def main(config: ServerConfig):
     print(f"  Embodiment tag: {config.embodiment_tag}")
     print(f"  Model path: {config.model_path}")
     print(f"  Device: {config.device}")
+    guidance_method = config.guidance_method
+    if guidance_method is None and config.guide_model_path is not None:
+        guidance_method = "autoguidance"
+    if guidance_method == "autoguidance" and config.guide_model_path is None:
+        raise ValueError("--guidance-method autoguidance requires --guide-model-path")
+    if guidance_method == "acg" and config.guide_model_path is not None:
+        raise ValueError("--guidance-method acg does not use --guide-model-path")
+    if guidance_method is None and config.guidance_scale != 1.0:
+        raise ValueError(
+            "--guidance-scale != 1.0 requires --guide-model-path or --guidance-method acg"
+        )
+    if guidance_method is not None:
+        print(f"  Guidance method: {guidance_method}")
+        print(f"  Guidance scale: {config.guidance_scale}")
     if config.guide_model_path is not None:
         print(f"  Guide model path: {config.guide_model_path}")
-        print(f"  Guidance scale: {config.guidance_scale}")
+    if guidance_method == "acg":
+        print(f"  ACG skip blocks: {config.acg_skip_blocks}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
 
@@ -121,6 +147,7 @@ def main(config: ServerConfig):
             strict=config.strict,
             guide_model_path=config.guide_model_path,
             guidance_scale=config.guidance_scale,
+            acg_skip_blocks=config.acg_skip_blocks if guidance_method == "acg" else None,
         )
     elif config.dataset_path is not None:
         if config.execution_horizon is None:

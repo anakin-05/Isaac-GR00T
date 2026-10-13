@@ -162,6 +162,7 @@ class Gr00tPolicy(BasePolicy):
         strict: bool = True,
         guide_model_path: str | None = None,
         guidance_scale: float = 1.0,
+        acg_skip_blocks: list[int] | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -176,6 +177,10 @@ class Gr00tPolicy(BasePolicy):
                 from the same base with a frozen backbone and the same normalization.
             guidance_scale: Autoguidance weight w; actions are sampled with velocity
                 v_guide + w * (v_main - v_guide). 1.0 disables guidance.
+            acg_skip_blocks: Enables Action Coherence Guidance (Park & Kim et al., 2026)
+                instead of autoguidance: indices of the self-attention (odd) DiT blocks whose
+                attention map is replaced by the identity to form the incoherent prediction.
+                Uses ``guidance_scale`` as w in v_bad + w * (v_main - v_bad). Needs no guide.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -249,12 +254,20 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
 
+        if guide_model_path is not None and acg_skip_blocks is not None:
+            raise ValueError("guide_model_path (autoguidance) and acg_skip_blocks (ACG) conflict")
         if guide_model_path is not None:
             self._attach_autoguidance(
                 Path(guide_model_path), guidance_scale, device=device, processor_dir=processor_dir
             )
+        elif acg_skip_blocks is not None:
+            self.model.set_acg(acg_skip_blocks, guidance_scale)
+            print(
+                f"ACG enabled: skip_blocks={self.model.acg_blocks}, guidance_scale={guidance_scale}",
+                flush=True,
+            )
         elif guidance_scale != 1.0:
-            raise ValueError("guidance_scale != 1.0 requires guide_model_path")
+            raise ValueError("guidance_scale != 1.0 requires guide_model_path or acg_skip_blocks")
 
     def _attach_autoguidance(
         self, guide_dir: Path, guidance_scale: float, *, device: int | str, processor_dir: Path

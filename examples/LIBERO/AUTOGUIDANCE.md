@@ -147,6 +147,36 @@ Caveat on screening: 100 episodes per configuration gives a standard error of ab
 bad ones. Confirm candidates at 50 episodes per task (500 episodes, standard error about
 1 point). All runs use the same seed, so the initial states are paired across configurations.
 
+## Alternative: Action Coherence Guidance (ACG)
+
+ACG (Park & Kim et al., ICRA 2026, arXiv:2510.22201) uses the same sampler update as autoguidance,
+`v = v_bad + w * (v_main - v_bad)` at each Euler step, but needs no guide model: `v_bad` comes from
+the main model itself, with the attention map of a few DiT **self-attention** blocks replaced by the
+identity (`out = to_out(to_v(x))`), so action tokens stop attending to each other and the prediction
+loses temporal coherence. Implementation: `gr00t/model/modules/acg.py` (identity processor, swapped in
+only for the bad forward pass and restored afterwards), `Gr00tN1d7.set_acg`, and the `acg_blocks`
+argument of `Gr00tN1d7ActionHead.get_action`. ACG and autoguidance are mutually exclusive.
+
+Blocks must be odd-indexed (self-attention; even blocks are cross-attention). The default
+`15 19 23` is the reference's blocks 7, 9, 11 of 16 at the same relative depth in the 32-block DiT.
+The reference samples with 16 Euler steps; GR00T N1.7 uses 4 here.
+
+```bash
+# Closed loop, switch from autoguidance to ACG
+GUIDANCE_METHOD=acg GUIDANCE_SCALE=3.0 ACG_SKIP_BLOCKS="15 19 23" \
+  bash examples/LIBERO/eval_libero_10.sh
+# Scale sweep with a w=1 control
+N_EPISODES=10 SCALES="1.5 2.0 3.0" bash examples/LIBERO/sweep_acg_libero_10.sh
+# Server
+uv run python gr00t/eval/run_gr00t_server.py --model-path <ckpt> --embodiment-tag LIBERO_PANDA \
+  --guidance-method acg --guidance-scale 3.0 --acg-skip-blocks 15 19 23
+# Open loop (adds configs acg_w<w> next to any autoguidance configs; GUIDE_RUN_DIR is optional)
+ACG_SKIP_BLOCKS="15 19 23" SCALES="1.5 2.0 3.0" bash examples/LIBERO/sweep_autoguidance_open_loop_libero_10.sh
+```
+
+In Python: `Gr00tPolicy(..., acg_skip_blocks=[15, 19, 23], guidance_scale=3.0)`.
+No ACG results are recorded here yet.
+
 ## Results
 
 Main model: the LIBERO-10 baseline above. Guide: 8-block DiT run

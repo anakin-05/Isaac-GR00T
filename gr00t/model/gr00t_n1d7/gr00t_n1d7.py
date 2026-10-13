@@ -25,6 +25,7 @@ from transformers.feature_extraction_utils import BatchFeature
 import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.model.modules.acg import acg_perturbation, validate_acg_blocks
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
@@ -330,6 +331,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         vl_embeds: torch.Tensor,
         embodiment_id: torch.Tensor,
         backbone_output: BatchFeature,
+        acg_blocks: list[int] | None = None,
     ) -> torch.Tensor:
         """
         Predict the flow matching velocity for one denoising step.
@@ -341,6 +343,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             vl_embeds: [B, seq_len, backbone_embedding_dim] (already passed through vlln)
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model (provides the attention masks)
+            acg_blocks: Optional self-attention block indices whose attention map is replaced
+                by the identity (the incoherent prediction of Action Coherence Guidance)
 
         Returns:
             [B, action_horizon, action_dim] predicted velocity
@@ -359,20 +363,21 @@ class Gr00tN1d7ActionHead(nn.Module):
         sa_embs = torch.cat((state_features, action_features), dim=1)
 
         # Run model forward.
+        model_kwargs = dict(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embeds,
+            timestep=timesteps_tensor,
+        )
         if self.config.use_alternate_vl_dit:
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                timestep=timesteps_tensor,
+            model_kwargs.update(
                 image_mask=backbone_output.image_mask,
                 backbone_attention_mask=backbone_output.backbone_attention_mask,
             )
+        if acg_blocks:
+            with acg_perturbation(self.model, acg_blocks):
+                model_output = self.model(**model_kwargs)
         else:
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                timestep=timesteps_tensor,
-            )
+            model_output = self.model(**model_kwargs)
         pred = self.action_decoder(model_output, embodiment_id)
 
         return pred[:, -self.action_horizon :]
@@ -389,6 +394,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         guide: "Gr00tN1d7ActionHead | None" = None,
         guide_features: BatchFeature | None = None,
         guidance_scale: float = 1.0,
+        acg_blocks: list[int] | None = None,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -401,9 +407,14 @@ class Gr00tN1d7ActionHead(nn.Module):
             guide: Optional weaker action head for autoguidance. It must share the
                 backbone (and therefore the attention masks in ``backbone_output``).
             guide_features: The guide's own ``_encode_features`` output.
-            guidance_scale: Autoguidance weight; 1.0 disables guidance.
+            guidance_scale: Guidance weight w (autoguidance or ACG); 1.0 disables guidance.
+            acg_blocks: Action Coherence Guidance: self-attention blocks to replace with
+                identity attention for the "bad" prediction. Mutually exclusive with ``guide``.
         """
         use_guide = guide is not None and guidance_scale != 1.0
+        use_acg = bool(acg_blocks) and guidance_scale != 1.0
+        if use_guide and use_acg:
+            raise ValueError("autoguidance (guide) and ACG (acg_blocks) cannot be combined")
         if use_guide and guide_features is None:
             raise ValueError("guide_features is required when guiding with a guide action head")
         vl_embeds = backbone_features
@@ -471,7 +482,25 @@ class Gr00tN1d7ActionHead(nn.Module):
                 actions, timesteps_tensor, state_features, vl_embeds, embodiment_id, backbone_output
             )
 
-            if use_guide:
+            if use_acg:
+                # ACG (Park & Kim et al. 2025): the bad prediction comes from the same model with
+                # the attention of a few self-attention blocks replaced by the identity;
+                # v = v_bad + w * (v_main - v_bad), the same form as autoguidance.
+                bad_velocity = self._predict_velocity(
+                    actions,
+                    timesteps_tensor,
+                    state_features,
+                    vl_embeds,
+                    embodiment_id,
+                    backbone_output,
+                    acg_blocks=acg_blocks,
+                )
+                pred_velocity = (
+                    bad_velocity.float()
+                    .lerp(pred_velocity.float(), guidance_scale)
+                    .to(pred_velocity.dtype)
+                )
+            elif use_guide:
                 # Autoguidance (Karras et al. 2024, "Guiding a Diffusion Model with a Bad
                 # Version of Itself"): extrapolate from a weaker version of the model toward
                 # the main model, D = D_guide + w * (D_main - D_guide). For fixed x_t and t the
@@ -509,6 +538,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         options: dict[str, Any] | None = None,
         guide: "Gr00tN1d7ActionHead | None" = None,
         guidance_scale: float = 1.0,
+        acg_blocks: list[int] | None = None,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -521,7 +551,9 @@ class Gr00tN1d7ActionHead(nn.Module):
                 - state: [B, state_dim]
                 - embodiment_id: [B] (embodiment IDs)
             guide: Optional weaker action head sharing this backbone, for autoguidance.
-            guidance_scale: Autoguidance weight; 1.0 disables guidance.
+            guidance_scale: Guidance weight; 1.0 disables guidance.
+            acg_blocks: Optional self-attention blocks to perturb for ACG (see
+                ``get_action_with_features``).
 
         Returns:
             BatchFeature containing:
@@ -545,6 +577,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             guide=guide if use_guide else None,
             guide_features=guide_features,
             guidance_scale=guidance_scale,
+            acg_blocks=acg_blocks,
         )
 
     @property
@@ -626,6 +659,9 @@ class Gr00tN1d7(PreTrainedModel):
         # Optional autoguidance guide head (inference only, see set_autoguidance).
         self.autoguidance_head = None
         self.autoguidance_scale = 1.0
+        # Optional Action Coherence Guidance (inference only, see set_acg).
+        self.acg_blocks: list[int] | None = None
+        self.acg_scale = 1.0
 
     def set_autoguidance(
         self, guide_head: Gr00tN1d7ActionHead | None, guidance_scale: float = 1.0
@@ -638,8 +674,26 @@ class Gr00tN1d7(PreTrainedModel):
         features and use the same action normalization. Passing ``None`` or
         ``guidance_scale == 1.0`` restores unguided sampling.
         """
+        if guide_head is not None and self.acg_blocks:
+            raise ValueError("autoguidance and ACG cannot be enabled together")
         self.autoguidance_head = guide_head
         self.autoguidance_scale = float(guidance_scale)
+
+    def set_acg(self, blocks: list[int] | None, guidance_scale: float = 1.0) -> None:
+        """
+        Enable Action Coherence Guidance (Park & Kim et al., ICRA 2026).
+
+        The "bad" prediction is this model's own velocity with the attention map of the given
+        self-attention DiT blocks replaced by the identity; sampling uses
+        ``v = v_bad + w * (v_main - v_bad)``. It needs no extra weights. Passing ``None`` or
+        ``guidance_scale == 1.0`` restores unguided sampling.
+        """
+        if blocks is not None:
+            if self.autoguidance_head is not None:
+                raise ValueError("autoguidance and ACG cannot be enabled together")
+            blocks = validate_acg_blocks(blocks, self.action_head.model.config.num_layers)
+        self.acg_blocks = blocks
+        self.acg_scale = float(guidance_scale)
 
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:
         """Prepare inputs for backbone and action head."""
@@ -705,7 +759,8 @@ class Gr00tN1d7(PreTrainedModel):
             action_inputs,
             options,
             guide=self.autoguidance_head,
-            guidance_scale=self.autoguidance_scale,
+            guidance_scale=self.acg_scale if self.acg_blocks else self.autoguidance_scale,
+            acg_blocks=self.acg_blocks,
         )
 
         return action_outputs
