@@ -258,6 +258,36 @@ class TestActionHeadAutoguidance:
         assert torch.isfinite(guided).all()
 
 
+class TestActionHeadTrajectory:
+    """return_trajectory exposes the denoising path and per-step guidance shift."""
+
+    def test_trajectory_and_shift(self):
+        config = _small_config()
+        head, guide = _make_head(0, config), _make_head(1, config)
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        backbone_output = _make_backbone_output(config)
+
+        def sample(**kw):
+            torch.manual_seed(7)
+            return head.get_action(_clone_batch(backbone_output), action_input, **kw)
+
+        plain = sample()
+        guided = sample(guide=guide, guidance_scale=2.0, return_trajectory=True)
+        n = config.num_inference_timesteps
+        traj, shift = guided["action_trajectory"], guided["guidance_shift"]
+        assert traj.shape == (n + 1, 2, config.action_horizon, config.max_action_dim)
+        assert shift.shape == (n, 2, config.action_horizon, config.max_action_dim)
+        assert torch.equal(traj[-1], guided["action_pred"])
+        assert shift.abs().max() > 0
+        # Tracking the path does not change the sample, and unguided shifts are zero.
+        again = sample(guide=guide, guidance_scale=2.0)
+        assert torch.equal(again["action_pred"], guided["action_pred"])
+        unguided = sample(return_trajectory=True)
+        assert torch.equal(unguided["action_pred"], plain["action_pred"])
+        assert unguided["guidance_shift"].abs().max() == 0
+
+
 class TestActionHeadACG:
     """Test Action Coherence Guidance: identity self-attention gives the bad prediction."""
 
@@ -367,6 +397,100 @@ class TestActionHeadACG:
         model.acg_blocks = None
         with pytest.raises(ValueError):
             model.set_acg([1], 2.0)
+
+
+class TestActionHeadAFIL:
+    """Test Adaptive Failure-Informed Learning: v = v_s + lam (v_s - v_f), lam = a (1 - cos)."""
+
+    REGION = (3, 5)  # (horizon, dim) of the real action chunk inside the padded output
+
+    def _sample(self, head, backbone_output, action_input, fail=None, alpha=1.0, region=REGION):
+        torch.manual_seed(1234)
+        return head.get_action(
+            _clone_batch(backbone_output),
+            action_input,
+            guide=fail,
+            guidance_scale=alpha,
+            adaptive_region=region,
+        )["action_pred"]
+
+    def _inputs(self, config):
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        return _make_backbone_output(config), action_input
+
+    def test_alpha_zero_matches_unguided(self):
+        config = _small_config()
+        head, fail = _make_head(0, config), _make_head(1, config)
+        backbone_output, action_input = self._inputs(config)
+        unguided = self._sample(head, backbone_output, action_input)
+        guided = self._sample(head, backbone_output, action_input, fail, alpha=0.0)
+        assert torch.equal(unguided, guided)
+
+    def test_identical_failure_head_matches_unguided(self):
+        # Same velocities -> cos = 1 -> lambda = 0 for any alpha.
+        config = _small_config()
+        head, fail = _make_head(0, config), _make_head(0, config)
+        backbone_output, action_input = self._inputs(config)
+        unguided = self._sample(head, backbone_output, action_input)
+        guided = self._sample(head, backbone_output, action_input, fail, alpha=5.0)
+        torch.testing.assert_close(guided, unguided, rtol=1e-5, atol=1e-5)
+
+    def test_matches_manual_rollout(self):
+        config = _small_config()
+        head, fail = _make_head(0, config), _make_head(1, config)
+        backbone_output, action_input = self._inputs(config)
+        alpha = 1.5
+        guided = self._sample(head, backbone_output, action_input, fail, alpha)
+
+        main_feats = head._encode_features(_clone_batch(backbone_output), action_input)
+        fail_feats = fail._encode_features(_clone_batch(backbone_output), action_input)
+        batch_size = action_input["state"].shape[0]
+        torch.manual_seed(1234)
+        actions = torch.randn(batch_size, config.action_horizon, config.max_action_dim)
+        n = config.num_inference_timesteps
+        horizon, dim = self.REGION
+        lams = []
+        for step in range(n):
+            t = torch.full((batch_size,), int(step / n * config.num_timestep_buckets))
+            emb = action_input["embodiment_id"]
+            v_s = head._predict_velocity(
+                actions,
+                t,
+                main_feats.state_features,
+                main_feats.backbone_features,
+                emb,
+                backbone_output,
+            )
+            v_f = fail._predict_velocity(
+                actions,
+                t,
+                fail_feats.state_features,
+                fail_feats.backbone_features,
+                emb,
+                backbone_output,
+            )
+            a = v_s[:, :horizon, :dim].reshape(batch_size, -1)
+            b = v_f[:, :horizon, :dim].reshape(batch_size, -1)
+            cos = (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1))
+            lam = alpha * (1 - cos)
+            lams.append(lam)
+            actions = actions + (v_s + lam[:, None, None] * (v_s - v_f)) / n
+
+        torch.testing.assert_close(guided, actions, rtol=1e-4, atol=1e-4)
+        # The adaptive scale differs per sample, otherwise this would just be autoguidance.
+        assert not torch.allclose(lams[0][0], lams[0][1], atol=1e-6)
+        unguided = self._sample(head, backbone_output, action_input)
+        assert not torch.allclose(guided, unguided, atol=1e-3)
+
+    def test_cosine_ignores_padded_region(self):
+        config = _small_config()
+        head, fail = _make_head(0, config), _make_head(1, config)
+        backbone_output, action_input = self._inputs(config)
+        full = (config.action_horizon, config.max_action_dim)
+        a = self._sample(head, backbone_output, action_input, fail, 1.0, region=self.REGION)
+        b = self._sample(head, backbone_output, action_input, fail, 1.0, region=full)
+        assert not torch.allclose(a, b, atol=1e-6)
 
 
 class TestActionHeadEncodeFeatures:

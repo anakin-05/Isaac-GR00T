@@ -74,8 +74,11 @@ class ServerConfig:
     """Guidance weight w: velocity = v_bad + w * (v_main - v_bad), where v_bad comes from the guide
     model (autoguidance) or the attention-perturbed model (ACG). 1.0 disables guidance."""
 
-    guidance_method: Literal["autoguidance", "acg"] | None = None
+    guidance_method: Literal["autoguidance", "acg", "afil"] | None = None
     """Guidance method. Default: autoguidance if --guide-model-path is set, otherwise none.
+    "afil" is Adaptive Failure-Informed Learning (Zheng et al., 2026): --guide-model-path is a
+    failure action generator and --guidance-scale is alpha of the adaptive
+    lambda = alpha * (1 - cos(v_succ, v_fail)); v = v_succ + lambda * (v_succ - v_fail).
     "acg" is Action Coherence Guidance (Park & Kim et al., 2026): training-free, the bad prediction
     uses identity attention in --acg-skip-blocks."""
 
@@ -115,8 +118,8 @@ def main(config: ServerConfig):
     guidance_method = config.guidance_method
     if guidance_method is None and config.guide_model_path is not None:
         guidance_method = "autoguidance"
-    if guidance_method == "autoguidance" and config.guide_model_path is None:
-        raise ValueError("--guidance-method autoguidance requires --guide-model-path")
+    if guidance_method in ("autoguidance", "afil") and config.guide_model_path is None:
+        raise ValueError(f"--guidance-method {guidance_method} requires --guide-model-path")
     if guidance_method == "acg" and config.guide_model_path is not None:
         raise ValueError("--guidance-method acg does not use --guide-model-path")
     if guidance_method is None and config.guidance_scale != 1.0:
@@ -148,6 +151,7 @@ def main(config: ServerConfig):
             guide_model_path=config.guide_model_path,
             guidance_scale=config.guidance_scale,
             acg_skip_blocks=config.acg_skip_blocks if guidance_method == "acg" else None,
+            guide_is_failure_model=guidance_method == "afil",
         )
     elif config.dataset_path is not None:
         if config.execution_horizon is None:

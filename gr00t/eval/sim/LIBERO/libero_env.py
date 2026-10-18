@@ -33,6 +33,7 @@ from libero.libero import benchmark
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+from gr00t.eval.sim.LIBERO.episode_recorder import EpisodeRecorder
 from libero.libero.envs import OffScreenRenderEnv
 from libero.libero.utils import get_libero_path
 import numpy as np
@@ -99,6 +100,12 @@ class LiberoEnv(gym.Env):
     """LanguageTable env."""
 
     def __init__(self, task_bddl_file: str, task_description: str):
+        # Optional failure/rollout recording, enabled by GR00T_LIBERO_RECORD_DIR.
+        self._recorder = None
+        if EpisodeRecorder.enabled():
+            self._recorder = EpisodeRecorder(
+                os.path.splitext(os.path.basename(task_bddl_file))[0], task_description
+            )
         # `ignore_done=True`: outer `MultiStepWrapper` owns truncation; robosuite's
         # horizon-termination is redundant and conflicts with LIBERO's done-override.
         self._env = OffScreenRenderEnv(
@@ -138,6 +145,8 @@ class LiberoEnv(gym.Env):
         )
 
     def close(self):
+        if self._recorder is not None:
+            self._recorder.close()
         self._env.close()
 
     def _process_observation(self, obs):
@@ -165,6 +174,8 @@ class LiberoEnv(gym.Env):
         observation = self._env.reset()
         observation = self._process_observation(observation)
         info = {"success": self._env.check_success()}
+        if self._recorder is not None:
+            self._recorder.reset(observation)
         return observation, info
 
     def step(self, action):
@@ -180,12 +191,15 @@ class LiberoEnv(gym.Env):
             ],
             axis=0,
         )
+        recorded_action = action_vector.copy()
         action_vector = normalize_gripper_action(action_vector)
         action_vector = invert_gripper_action(action_vector)
         observation, reward, done, info = self._env.step(action_vector)
         observation = self._process_observation(observation)
         info["success"] = self._env.check_success()
         truncated = False
+        if self._recorder is not None:
+            self._recorder.step(recorded_action, observation, info["success"])
         return observation, reward, done, truncated, info
 
 

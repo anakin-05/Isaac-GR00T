@@ -85,6 +85,11 @@ class ArgsConfig:
     self-attention (odd) DiT blocks whose attention map is replaced by identity for the bad
     prediction. Needs no guide model and can be combined with --guide-steps."""
 
+    afil_alphas: list[float] = field(default_factory=list)
+    """Treat each --guide-steps checkpoint as a *failure* model (Adaptive Failure-Informed Learning)
+    and evaluate configs ``guide<step>_afil<alpha>`` with lambda = alpha * (1 - cos(v_succ, v_fail))
+    for every alpha listed. The usual fixed-scale configs still follow --scales."""
+
     include_guide_only: bool = True
     """Also evaluate each guide alone (w=0), to show how much worse the 'bad version' is."""
 
@@ -120,7 +125,9 @@ def infer_dataset_path(model_path: str) -> str:
     return OmegaConf.load(conf).data.datasets[0].dataset_paths[0]
 
 
-def config_name(guide_step: int | None, scale: float, acg: bool = False) -> str:
+def config_name(guide_step: int | None, scale: float, acg: bool = False, afil: bool = False) -> str:
+    if afil:
+        return f"guide{guide_step}_afil{scale:g}"
     if acg:
         return f"acg_w{scale:g}"
     return MAIN if guide_step is None else f"guide{guide_step}_w{scale:g}"
@@ -263,6 +270,8 @@ def main(args: ArgsConfig) -> None:
 
     if args.guide_steps and args.guide_run_dir is None:
         raise ValueError("--guide-steps requires --guide-run-dir")
+    if args.afil_alphas and not args.guide_steps:
+        raise ValueError("--afil-alphas needs the failure model checkpoints in --guide-steps")
     tag = EmbodimentTag.resolve(args.embodiment_tag)
     dataset_path = args.dataset_path or infer_dataset_path(args.model_path)
     print(f"Main model: {args.model_path}\nDataset: {dataset_path}", flush=True)
@@ -293,6 +302,8 @@ def main(args: ArgsConfig) -> None:
     action_cfg = loader.modality_configs["action"]
     action_keys = action_cfg.modality_keys
     horizon = len(action_cfg.delta_indices)
+    # AFIL takes its cosine over the real (unpadded) action chunk.
+    afil_region = (horizon, policy.processor.state_action_processor.get_action_dim(tag.value))
     stride = args.stride or horizon
     traj_ids = args.traj_ids if args.traj_ids is not None else list(range(len(loader)))
     bad = [t for t in traj_ids if not 0 <= t < len(loader)]
@@ -300,18 +311,23 @@ def main(args: ArgsConfig) -> None:
         raise ValueError(f"traj ids {bad} out of range for a dataset with {len(loader)} episodes")
 
     # Configurations: unguided main, then per guide the guide alone and every w != 1.
-    # (name, guide step, w, ACG blocks); ACG configs perturb the main model itself.
-    configs: list[tuple[str, int | None, float, list[int] | None]] = [(MAIN, None, 1.0, None)]
+    # (name, guide step, w, ACG blocks, AFIL); ACG configs perturb the main model itself.
+    configs: list[tuple[str, int | None, float, list[int] | None, bool]] = [
+        (MAIN, None, 1.0, None, False)
+    ]
     for step in args.guide_steps:
         if args.include_guide_only:
-            configs.append((config_name(step, 0.0), step, 0.0, None))
+            configs.append((config_name(step, 0.0), step, 0.0, None, False))
         for w in args.scales:
             if w != 1.0:  # identical to the main model
-                configs.append((config_name(step, w), step, w, None))
+                configs.append((config_name(step, w), step, w, None, False))
+        for alpha in args.afil_alphas:
+            if alpha != 0.0:  # identical to the main model
+                configs.append((config_name(step, alpha, afil=True), step, alpha, None, True))
     if acg_blocks is not None:
         for w in args.scales:
             if w != 1.0:
-                configs.append((config_name(None, w, acg=True), None, w, acg_blocks))
+                configs.append((config_name(None, w, acg=True), None, w, acg_blocks, False))
 
     (out_dir / "eval_config.json").write_text(
         json.dumps(
@@ -353,7 +369,7 @@ def main(args: ArgsConfig) -> None:
             backbone_inputs, action_inputs = model.prepare_input(collated["inputs"])
             backbone_out = model.backbone(backbone_inputs)  # shared by every configuration
             main_pred = None
-            for name, step, w, blocks in configs:
+            for name, step, w, blocks, afil in configs:
                 torch.manual_seed(args.seed + batch_index)  # same noise for every configuration
                 # get_action overwrites backbone_features in place (vlln), so pass a copy.
                 out = model.action_head.get_action(
@@ -362,6 +378,7 @@ def main(args: ArgsConfig) -> None:
                     guide=None if step is None else guides[step],
                     guidance_scale=w,
                     acg_blocks=blocks,
+                    adaptive_region=afil_region if afil else None,
                 )
                 pred = decode(out["action_pred"])
                 if name == MAIN:

@@ -14,6 +14,16 @@
 # Set ACG_SKIP_BLOCKS (e.g. "15 19 23") to also sweep Action Coherence Guidance over the same
 # SCALES (no guide model needed; GUIDE_RUN_DIR may then be left unset to run only ACG).
 #
+# Adaptive Failure-Informed Learning (AFIL, see AFIL.md): set AFIL_ALPHAS (alpha of
+# lambda = alpha * (1 - cos(v_succ, v_fail))). GUIDE_RUN_DIR is then the training dir of the
+# *failure* model and every (GUIDE_STEPS checkpoint, alpha) pair is evaluated, like the
+# (GUIDE_STEPS, SCALES) pairs of autoguidance (which is skipped for that dir):
+#   GUIDE_RUN_DIR=<failure run> GUIDE_STEPS="1000 3000 5000" AFIL_ALPHAS="0.5 1.0 2.0" \
+#     bash examples/LIBERO/sweep_autoguidance_libero_10.sh
+# Alternatively give a single failure checkpoint in FAILURE_MODEL_PATH (AFIL_ALPHAS defaults to
+# "0.5 1.0 2.0"); GUIDE_RUN_DIR / GUIDE_STEPS / SCALES then keep their autoguidance meaning.
+# ACG_SKIP_BLOCKS can be combined with either.
+#
 # Any eval_libero_10.sh setting (MODEL_PATH, N_ENVS, PORT, ...) can be
 # overridden through the environment as well. See AUTOGUIDANCE.md.
 
@@ -24,11 +34,30 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 ACG_SKIP_BLOCKS="${ACG_SKIP_BLOCKS:-}"
-if [ -z "$ACG_SKIP_BLOCKS" ]; then
-  GUIDE_RUN_DIR="${GUIDE_RUN_DIR:?set GUIDE_RUN_DIR to the training output dir of the guide model}"
-fi
+FAILURE_MODEL_PATH="${FAILURE_MODEL_PATH:-}"
 GUIDE_RUN_DIR="${GUIDE_RUN_DIR:-}"
-GUIDE_LABEL="${GUIDE_LABEL:-$([ -n "$GUIDE_RUN_DIR" ] && echo autoguidance-dit8 || echo acg)}"
+if [ -n "$FAILURE_MODEL_PATH" ]; then
+  # shellcheck disable=SC2206
+  AFIL_ALPHAS=(${AFIL_ALPHAS:-0.5 1.0 2.0})
+else
+  # shellcheck disable=SC2206
+  AFIL_ALPHAS=(${AFIL_ALPHAS:-})
+fi
+# Without FAILURE_MODEL_PATH, AFIL_ALPHAS makes GUIDE_RUN_DIR a failure run.
+AFIL_RUN_DIR=""
+if [ -z "$FAILURE_MODEL_PATH" ] && [ "${#AFIL_ALPHAS[@]}" -gt 0 ]; then
+  AFIL_RUN_DIR="${GUIDE_RUN_DIR:?AFIL_ALPHAS needs GUIDE_RUN_DIR (failure run dir) or FAILURE_MODEL_PATH}"
+fi
+if [ -z "$ACG_SKIP_BLOCKS" ] && [ -z "$FAILURE_MODEL_PATH" ] && [ -z "$GUIDE_RUN_DIR" ]; then
+  echo "ERROR: set GUIDE_RUN_DIR to the training output dir of the guide model" >&2
+  exit 1
+fi
+GUIDE_LABEL="${GUIDE_LABEL:-$(
+  if [ -n "$AFIL_RUN_DIR" ]; then echo afil
+  elif [ -n "$GUIDE_RUN_DIR" ]; then echo autoguidance-dit8
+  elif [ -n "$ACG_SKIP_BLOCKS" ]; then echo acg
+  else echo afil; fi
+)}"
 if [ -n "$GUIDE_RUN_DIR" ]; then
   # shellcheck disable=SC2206
   GUIDE_STEPS=(${GUIDE_STEPS:-2000 5000 10000})
@@ -63,6 +92,35 @@ if [ -n "$ACG_SKIP_BLOCKS" ]; then
     run_eval "gr00t-n17_acg-${BLOCK_TAG}-w${W}_libero-panda_libero-10_n${N_EPISODES}-seed${SEED}" \
       GUIDANCE_METHOD=acg GUIDE_MODEL_PATH= GUIDANCE_SCALE="$W" ACG_SKIP_BLOCKS="$ACG_SKIP_BLOCKS"
   done
+fi
+
+if [ -n "$FAILURE_MODEL_PATH" ]; then
+  if [ ! -d "$FAILURE_MODEL_PATH" ]; then
+    echo "ERROR: $FAILURE_MODEL_PATH not found" >&2
+    exit 1
+  fi
+  FAILURE_TAG="${FAILURE_TAG:-$(basename "$FAILURE_MODEL_PATH")}"
+  for ALPHA in "${AFIL_ALPHAS[@]}"; do
+    run_eval "gr00t-n17_afil-${FAILURE_TAG}-alpha${ALPHA}_libero-panda_libero-10_n${N_EPISODES}-seed${SEED}" \
+      GUIDANCE_METHOD=afil GUIDE_MODEL_PATH="$FAILURE_MODEL_PATH" GUIDANCE_SCALE="$ALPHA"
+  done
+fi
+
+# GUIDE_RUN_DIR as a failure run: AFIL over (checkpoint, alpha), no fixed-scale autoguidance.
+if [ -n "$AFIL_RUN_DIR" ]; then
+  FAILURE_TAG="${FAILURE_TAG:-$(basename "$AFIL_RUN_DIR")}"
+  for STEP in "${GUIDE_STEPS[@]}"; do
+    FAIL_CKPT="$AFIL_RUN_DIR/checkpoint-$STEP"
+    if [ ! -d "$FAIL_CKPT" ]; then
+      echo "ERROR: $FAIL_CKPT not found" >&2
+      exit 1
+    fi
+    for ALPHA in "${AFIL_ALPHAS[@]}"; do
+      run_eval "gr00t-n17_afil-${FAILURE_TAG}-step${STEP}-alpha${ALPHA}_libero-panda_libero-10_n${N_EPISODES}-seed${SEED}" \
+        GUIDANCE_METHOD=afil GUIDE_MODEL_PATH="$FAIL_CKPT" GUIDANCE_SCALE="$ALPHA"
+    done
+  done
+  GUIDE_STEPS=()
 fi
 
 for STEP in ${GUIDE_STEPS[@]+"${GUIDE_STEPS[@]}"}; do

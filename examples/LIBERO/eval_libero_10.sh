@@ -25,6 +25,15 @@
 #   GUIDANCE_METHOD=acg GUIDANCE_SCALE=3.0 ACG_SKIP_BLOCKS="15 19 23" \
 #     bash examples/LIBERO/eval_libero_10.sh
 #
+# Adaptive Failure-Informed Learning (AFIL): GUIDE_MODEL_PATH is a failure action generator
+# (see AFIL.md); GUIDANCE_SCALE is alpha of lambda = alpha * (1 - cos(v_succ, v_fail)):
+#   GUIDANCE_METHOD=afil GUIDE_MODEL_PATH=<failure ckpt> GUIDANCE_SCALE=1.0 \
+#     bash examples/LIBERO/eval_libero_10.sh
+#
+# Failure collection: RECORD_FAILURES_DIR=<dir> records every failed episode (videos, states,
+# actions) of the evaluated policy; use a fresh SEED to get new initial states. Turn the
+# recordings into a dataset with examples/LIBERO/build_failure_dataset.py.
+#
 # Output goes to examples/LIBERO/logs/eval_results/$RUN_NAME, where RUN_NAME
 # encodes the method, guidance scale, episode count and seed, so runs with
 # different settings never share (or SKIP_EXISTING-skip) each other's results.
@@ -48,6 +57,7 @@ GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
 # when GUIDE_MODEL_PATH is set, otherwise no guidance.
 GUIDANCE_METHOD="${GUIDANCE_METHOD:-}"
 ACG_SKIP_BLOCKS="${ACG_SKIP_BLOCKS:-15 19 23}"
+RECORD_FAILURES_DIR="${RECORD_FAILURES_DIR:-}"
 EMBODIMENT_TAG="${EMBODIMENT_TAG:-LIBERO_PANDA}"
 N_EPISODES="${N_EPISODES:-50}"
 SEED="${SEED:-42}"
@@ -59,6 +69,8 @@ MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
 HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 if [ "$GUIDANCE_METHOD" = "acg" ]; then
   METHOD="acg-blocks$(echo "$ACG_SKIP_BLOCKS" | tr ' ' '-')-w${GUIDANCE_SCALE}"
+elif [ "$GUIDANCE_METHOD" = "afil" ]; then
+  METHOD="afil-${GUIDE_TAG:-$(basename "$GUIDE_MODEL_PATH")}-alpha${GUIDANCE_SCALE}"
 elif [ -n "$GUIDE_MODEL_PATH" ]; then
   METHOD="autoguidance-${GUIDE_TAG:-$(basename "$GUIDE_MODEL_PATH")}-w${GUIDANCE_SCALE}"
 else
@@ -114,8 +126,11 @@ if [ "$GUIDANCE_METHOD" = "acg" ]; then
   # shellcheck disable=SC2206
   ACG_BLOCK_LIST=($ACG_SKIP_BLOCKS)
   GUIDE_ARGS=(--guidance-method acg --guidance-scale "$GUIDANCE_SCALE" --acg-skip-blocks "${ACG_BLOCK_LIST[@]}")
-elif [ -n "$GUIDANCE_METHOD" ] && [ "$GUIDANCE_METHOD" != "autoguidance" ]; then
-  echo "ERROR: unknown GUIDANCE_METHOD=$GUIDANCE_METHOD (use acg or autoguidance)" >&2
+elif [ -n "$GUIDANCE_METHOD" ] && [ "$GUIDANCE_METHOD" != "autoguidance" ] && [ "$GUIDANCE_METHOD" != "afil" ]; then
+  echo "ERROR: unknown GUIDANCE_METHOD=$GUIDANCE_METHOD (use acg, afil or autoguidance)" >&2
+  exit 1
+elif [ "$GUIDANCE_METHOD" = "afil" ] && [ -z "$GUIDE_MODEL_PATH" ]; then
+  echo "ERROR: GUIDANCE_METHOD=afil requires GUIDE_MODEL_PATH (the failure model)" >&2
   exit 1
 elif [ -n "$GUIDE_MODEL_PATH" ]; then
   if [ ! -d "$GUIDE_MODEL_PATH" ]; then
@@ -123,6 +138,7 @@ elif [ -n "$GUIDE_MODEL_PATH" ]; then
     exit 1
   fi
   GUIDE_ARGS=(--guide-model-path "$GUIDE_MODEL_PATH" --guidance-scale "$GUIDANCE_SCALE")
+  [ -z "$GUIDANCE_METHOD" ] || GUIDE_ARGS+=(--guidance-method "$GUIDANCE_METHOD")
 elif [ "$GUIDANCE_SCALE" != "1.0" ] && [ "$GUIDANCE_SCALE" != "1" ]; then
   echo "ERROR: GUIDANCE_SCALE=$GUIDANCE_SCALE requires GUIDE_MODEL_PATH or GUIDANCE_METHOD=acg" >&2
   exit 1
@@ -135,6 +151,17 @@ if [ ! -x "$CLIENT_PYTHON" ]; then
 fi
 
 mkdir -p "$VIDEO_ROOT" "$RESULTS_DIR" "$LOGS_DIR"
+
+# Optional failed-episode recording (read by gr00t/eval/sim/LIBERO/libero_env.py in the client).
+if [ -n "$RECORD_FAILURES_DIR" ]; then
+  mkdir -p "$RECORD_FAILURES_DIR"
+  export GR00T_LIBERO_RECORD_DIR="$(cd "$RECORD_FAILURES_DIR" && pwd)"
+  export GR00T_LIBERO_RECORD_MODE=failure
+  # An episode counts as failed only if it ran to the step limit without succeeding, so episodes
+  # cut short when a rollout ends are not recorded.
+  export GR00T_LIBERO_RECORD_MIN_STEPS="$MAX_EPISODE_STEPS"
+  echo "Recording failed episodes to $GR00T_LIBERO_RECORD_DIR"
+fi
 
 # Record what was evaluated next to the results.
 python3 - "$OUTPUT_ROOT/eval_config.json" "$MODEL_PATH" "$GUIDE_MODEL_PATH" "$GUIDANCE_SCALE" \

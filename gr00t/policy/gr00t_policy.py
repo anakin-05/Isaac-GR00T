@@ -163,6 +163,7 @@ class Gr00tPolicy(BasePolicy):
         guide_model_path: str | None = None,
         guidance_scale: float = 1.0,
         acg_skip_blocks: list[int] | None = None,
+        guide_is_failure_model: bool = False,
     ):
         """Initialize the Gr00t Policy.
 
@@ -181,6 +182,10 @@ class Gr00tPolicy(BasePolicy):
                 instead of autoguidance: indices of the self-attention (odd) DiT blocks whose
                 attention map is replaced by the identity to form the incoherent prediction.
                 Uses ``guidance_scale`` as w in v_bad + w * (v_main - v_bad). Needs no guide.
+            guide_is_failure_model: Treat ``guide_model_path`` as a failure action generator
+                and use Adaptive Failure-Informed Learning (AFIL, Zheng et al. 2026):
+                v = v_succ + lambda * (v_succ - v_fail) with lambda = guidance_scale (alpha) *
+                (1 - cos(v_succ, v_fail)). guidance_scale=0 disables guidance.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -258,8 +263,14 @@ class Gr00tPolicy(BasePolicy):
             raise ValueError("guide_model_path (autoguidance) and acg_skip_blocks (ACG) conflict")
         if guide_model_path is not None:
             self._attach_autoguidance(
-                Path(guide_model_path), guidance_scale, device=device, processor_dir=processor_dir
+                Path(guide_model_path),
+                guidance_scale,
+                device=device,
+                processor_dir=processor_dir,
+                adaptive=guide_is_failure_model,
             )
+        elif guide_is_failure_model:
+            raise ValueError("guide_is_failure_model requires guide_model_path")
         elif acg_skip_blocks is not None:
             self.model.set_acg(acg_skip_blocks, guidance_scale)
             print(
@@ -270,7 +281,13 @@ class Gr00tPolicy(BasePolicy):
             raise ValueError("guidance_scale != 1.0 requires guide_model_path or acg_skip_blocks")
 
     def _attach_autoguidance(
-        self, guide_dir: Path, guidance_scale: float, *, device: int | str, processor_dir: Path
+        self,
+        guide_dir: Path,
+        guidance_scale: float,
+        *,
+        device: int | str,
+        processor_dir: Path,
+        adaptive: bool = False,
     ) -> None:
         """Load a guide model and attach its action head to ``self.model`` for autoguidance.
 
@@ -312,11 +329,21 @@ class Gr00tPolicy(BasePolicy):
         del guide, guide_backbone
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self.model.set_autoguidance(guide_head, guidance_scale)
+        region = None
+        if adaptive:
+            # AFIL takes the cosine over the real action chunk, not the padded model output.
+            region = (
+                len(self.modality_configs["action"].delta_indices),
+                self.processor.state_action_processor.get_action_dim(self.embodiment_tag.value),
+            )
+        self.model.set_autoguidance(guide_head, guidance_scale, region)
         print(
-            f"Autoguidance enabled: guide={guide_dir} "
+            f"{'AFIL (adaptive failure-informed guidance)' if adaptive else 'Autoguidance'} "
+            f"enabled: guide={guide_dir} "
             f"(DiT layers={guide_head.config.diffusion_model_cfg['num_layers']}), "
-            f"guidance_scale={guidance_scale}; backbone and normalization checks passed",
+            f"{'alpha' if adaptive else 'guidance_scale'}={guidance_scale}"
+            f"{f', cosine region={region}' if adaptive else ''}; "
+            "backbone and normalization checks passed",
             flush=True,
         )
 

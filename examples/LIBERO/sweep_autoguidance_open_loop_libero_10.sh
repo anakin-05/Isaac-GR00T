@@ -29,6 +29,9 @@
 #   BATCH_SIZE, SEED          sampling batch size / noise seed (defaults 16 / 0)
 #   ACG_SKIP_BLOCKS           also evaluate Action Coherence Guidance (config acg_w<w> for each of
 #                             SCALES, no guide model needed), e.g. "15 19 23"; unset = skip
+#   AFIL_ALPHAS              Adaptive Failure-Informed Learning: treat GUIDE_RUN_DIR as a failure
+#                             model run and also evaluate configs guide<step>_afil<alpha> for each
+#                             alpha (lambda = alpha * (1 - cos(v_succ, v_fail))); see AFIL.md
 #   INCLUDE_GUIDE_ONLY        1 also evaluates each guide alone (default 1)
 #   RUN_NAME, OUTPUT_ROOT     output location (default: eval_results/open-loop_<label>_seed<SEED>)
 #   SKIP_EXISTING             1 skips a finished run (default 1)
@@ -91,6 +94,11 @@ if [ -n "${ACG_SKIP_BLOCKS:-}" ]; then
   # shellcheck disable=SC2206
   ACG_LIST=($ACG_SKIP_BLOCKS)
   ARGS+=(--acg-skip-blocks "${ACG_LIST[@]}")
+fi
+if [ -n "${AFIL_ALPHAS:-}" ]; then
+  # shellcheck disable=SC2206
+  AFIL_LIST=($AFIL_ALPHAS)
+  ARGS+=(--afil-alphas "${AFIL_LIST[@]}")
 fi
 [ "$INCLUDE_GUIDE_ONLY" = "1" ] || ARGS+=(--no-include-guide-only)
 [ "$SKIP_EXISTING" = "1" ] || ARGS+=(--no-skip-existing)

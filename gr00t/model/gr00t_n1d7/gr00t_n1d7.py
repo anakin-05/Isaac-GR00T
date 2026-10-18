@@ -36,6 +36,13 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
 logger = logging.getLogger(__name__)
 
 
+def _guide_active(guide, guidance_scale: float, adaptive_region) -> bool:
+    """Whether guidance changes the sampling: w=1 is a no-op, and so is alpha=0 for AFIL."""
+    if guide is None:
+        return False
+    return guidance_scale != (0.0 if adaptive_region is not None else 1.0)
+
+
 class Gr00tN1d7ActionHead(nn.Module):
     """Action head component for flow matching diffusion policy."""
 
@@ -395,6 +402,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         guide_features: BatchFeature | None = None,
         guidance_scale: float = 1.0,
         acg_blocks: list[int] | None = None,
+        adaptive_region: tuple[int, int] | None = None,
+        return_trajectory: bool = False,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -410,8 +419,16 @@ class Gr00tN1d7ActionHead(nn.Module):
             guidance_scale: Guidance weight w (autoguidance or ACG); 1.0 disables guidance.
             acg_blocks: Action Coherence Guidance: self-attention blocks to replace with
                 identity attention for the "bad" prediction. Mutually exclusive with ``guide``.
+            adaptive_region: Adaptive Failure-Informed Learning (AFIL): ``guide`` is then the
+                failure action generator and ``guidance_scale`` is alpha in
+                ``v = v_succ + lambda * (v_succ - v_fail)``, ``lambda = alpha * (1 - cos(v_succ,
+                v_fail))``. The cosine is taken per sample over the first ``(horizon, dim)``
+                entries of the velocity, i.e. the real (unpadded) action chunk.
+            return_trajectory: Also return ``action_trajectory`` [steps + 1, B, H, D] (the
+                denoising path) and ``guidance_shift`` [steps, B, H, D] (how much guidance
+                changed the velocity at each step, zero when unguided); for visualization.
         """
-        use_guide = guide is not None and guidance_scale != 1.0
+        use_guide = _guide_active(guide, guidance_scale, adaptive_region)
         use_acg = bool(acg_blocks) and guidance_scale != 1.0
         if use_guide and use_acg:
             raise ValueError("autoguidance (guide) and ACG (acg_blocks) cannot be combined")
@@ -430,6 +447,8 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
+        trajectory = [actions.clone()] if return_trajectory else None
+        guidance_shifts = [] if return_trajectory else None
 
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
@@ -482,6 +501,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 actions, timesteps_tensor, state_features, vl_embeds, embodiment_id, backbone_output
             )
 
+            main_velocity = pred_velocity
             if use_acg:
                 # ACG (Park & Kim et al. 2025): the bad prediction comes from the same model with
                 # the attention of a few self-attention blocks replaced by the identity;
@@ -499,6 +519,29 @@ class Gr00tN1d7ActionHead(nn.Module):
                     bad_velocity.float()
                     .lerp(pred_velocity.float(), guidance_scale)
                     .to(pred_velocity.dtype)
+                )
+            elif use_guide and adaptive_region is not None:
+                # AFIL (Zheng et al. 2026, "Failing Forward"): push the success velocity away
+                # from the failure velocity by an amount that grows as the two disagree.
+                fail_velocity = guide._predict_velocity(
+                    actions,
+                    timesteps_tensor,
+                    guide_features.state_features,
+                    guide_features.backbone_features,
+                    embodiment_id,
+                    backbone_output,
+                ).float()
+                succ_velocity = pred_velocity.float()
+                horizon, dim = adaptive_region
+                cos = F.cosine_similarity(
+                    succ_velocity[:, :horizon, :dim].flatten(1),
+                    fail_velocity[:, :horizon, :dim].flatten(1),
+                    dim=1,
+                    eps=1e-8,
+                )
+                lam = (guidance_scale * (1.0 - cos))[:, None, None]
+                pred_velocity = (succ_velocity + lam * (succ_velocity - fail_velocity)).to(
+                    pred_velocity.dtype
                 )
             elif use_guide:
                 # Autoguidance (Karras et al. 2024, "Guiding a Diffusion Model with a Bad
@@ -519,16 +562,23 @@ class Gr00tN1d7ActionHead(nn.Module):
                     .to(pred_velocity.dtype)
                 )
 
+            if return_trajectory:
+                guidance_shifts.append((pred_velocity.float() - main_velocity.float()).clone())
+
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
+            if return_trajectory:
+                trajectory.append(actions.clone())
 
-        return BatchFeature(
-            data={
-                "action_pred": actions,
-                "backbone_features": vl_embeds,
-                "state_features": state_features,
-            }
-        )
+        output = {
+            "action_pred": actions,
+            "backbone_features": vl_embeds,
+            "state_features": state_features,
+        }
+        if return_trajectory:
+            output["action_trajectory"] = torch.stack(trajectory)
+            output["guidance_shift"] = torch.stack(guidance_shifts)
+        return BatchFeature(data=output)
 
     @torch.no_grad()
     def get_action(
@@ -539,6 +589,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         guide: "Gr00tN1d7ActionHead | None" = None,
         guidance_scale: float = 1.0,
         acg_blocks: list[int] | None = None,
+        adaptive_region: tuple[int, int] | None = None,
+        return_trajectory: bool = False,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -554,12 +606,15 @@ class Gr00tN1d7ActionHead(nn.Module):
             guidance_scale: Guidance weight; 1.0 disables guidance.
             acg_blocks: Optional self-attention blocks to perturb for ACG (see
                 ``get_action_with_features``).
+            adaptive_region: Optional ``(horizon, dim)``; makes ``guide`` an AFIL failure
+                generator with adaptive guidance (see ``get_action_with_features``).
+            return_trajectory: Also return the denoising path and per-step guidance shift.
 
         Returns:
             BatchFeature containing:
                 - action_pred: [B, action_horizon, action_dim] predicted actions
         """
-        use_guide = guide is not None and guidance_scale != 1.0
+        use_guide = _guide_active(guide, guidance_scale, adaptive_region)
         # _encode_features applies vlln to backbone_output in place, so the guide gets its
         # own shallow copy holding the raw backbone features.
         guide_backbone_output = BatchFeature(data=dict(backbone_output)) if use_guide else None
@@ -578,6 +633,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             guide_features=guide_features,
             guidance_scale=guidance_scale,
             acg_blocks=acg_blocks,
+            adaptive_region=adaptive_region,
+            return_trajectory=return_trajectory,
         )
 
     @property
@@ -659,12 +716,16 @@ class Gr00tN1d7(PreTrainedModel):
         # Optional autoguidance guide head (inference only, see set_autoguidance).
         self.autoguidance_head = None
         self.autoguidance_scale = 1.0
+        self.autoguidance_adaptive_region: tuple[int, int] | None = None
         # Optional Action Coherence Guidance (inference only, see set_acg).
         self.acg_blocks: list[int] | None = None
         self.acg_scale = 1.0
 
     def set_autoguidance(
-        self, guide_head: Gr00tN1d7ActionHead | None, guidance_scale: float = 1.0
+        self,
+        guide_head: Gr00tN1d7ActionHead | None,
+        guidance_scale: float = 1.0,
+        adaptive_region: tuple[int, int] | None = None,
     ) -> None:
         """
         Guide action sampling with a weaker version of this model's action head.
@@ -673,11 +734,17 @@ class Gr00tN1d7(PreTrainedModel):
         Itself" (Karras et al., 2024). The guide head must run on this model's backbone
         features and use the same action normalization. Passing ``None`` or
         ``guidance_scale == 1.0`` restores unguided sampling.
+
+        With ``adaptive_region=(horizon, dim)`` the guide is instead a *failure* action
+        generator (Adaptive Failure-Informed Learning, Zheng et al. 2026) and
+        ``guidance_scale`` is alpha of the adaptive scale lambda = alpha * (1 - cos(v_succ,
+        v_fail)); alpha == 0 restores unguided sampling.
         """
         if guide_head is not None and self.acg_blocks:
             raise ValueError("autoguidance and ACG cannot be enabled together")
         self.autoguidance_head = guide_head
         self.autoguidance_scale = float(guidance_scale)
+        self.autoguidance_adaptive_region = adaptive_region if guide_head is not None else None
 
     def set_acg(self, blocks: list[int] | None, guidance_scale: float = 1.0) -> None:
         """
@@ -761,6 +828,7 @@ class Gr00tN1d7(PreTrainedModel):
             guide=self.autoguidance_head,
             guidance_scale=self.acg_scale if self.acg_blocks else self.autoguidance_scale,
             acg_blocks=self.acg_blocks,
+            adaptive_region=self.autoguidance_adaptive_region,
         )
 
         return action_outputs
