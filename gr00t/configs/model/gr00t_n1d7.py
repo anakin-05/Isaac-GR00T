@@ -109,6 +109,22 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # Correction training (arXiv 2610.14136). A corrector network (a full copy of the
+    # action head's encoders/DiT/decoder) refines the stop-gradient clean-action proposal
+    # x_hat = z + (1 - t) * v_hat. Its velocity output is mixed with the base velocity via a
+    # learned gate initialized to 0, so the corrected policy equals the base policy at init.
+    use_correction: bool = False
+    base_loss_weight: float = 1.0  # weight of the denoiser flow-matching loss
+    correction_loss_weight: float = 1.0  # lambda_corr, weight of the corrector loss
+    correction_train_steps: int = 1  # K_train: corrections unrolled during training
+    correction_gate_init: float = 0.0
+    correction_gate_shape: str = "scalar"  # "scalar" or "channel" (one gate per action dim)
+    correction_freeze_denoiser: bool = False  # train only the corrector
+    num_inference_corrections: int = 2  # K: corrections per denoising step at inference
+    # Apply corrections only when the flow time t_cont (0 = noise, 1 = data) of a denoising
+    # step lies in [lo, hi).
+    correction_interval: tuple[float, float] = (0.0, 1.0)
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True

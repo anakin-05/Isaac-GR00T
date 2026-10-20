@@ -25,6 +25,7 @@ from transformers.feature_extraction_utils import BatchFeature
 import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.model.modules.correction import ActionCorrector
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
@@ -114,6 +115,19 @@ class Gr00tN1d7ActionHead(nn.Module):
             torch.tensor(float(config.noise_beta_beta), dtype=torch.float32, device="cpu"),
         )
         self.num_timestep_buckets = config.num_timestep_buckets
+
+        # Correction training: the corrector is a full copy of the denoising network.
+        # Its weights are re-copied from the pretrained head after checkpoint loading
+        # (see Gr00tN1d7Pipeline._create_model).
+        if getattr(config, "use_correction", False):
+            self.corrector = ActionCorrector(
+                self,
+                gate_init=config.correction_gate_init,
+                gate_shape=config.correction_gate_shape,
+            )
+        else:
+            self.corrector = None
+
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -137,6 +151,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         if not tune_vlln:
             self.vlln.requires_grad_(False)
             self.vl_self_attention.requires_grad_(False)
+        if self.corrector is not None:
+            if self.config.correction_freeze_denoiser:
+                for name, module in self.named_children():
+                    if name != "corrector":
+                        module.requires_grad_(False)
+            # The corrector is always trained when correction training is enabled.
+            self.corrector.requires_grad_(True)
         logger.debug(f"Tune action head projector: {self.tune_projector}")
         logger.debug(f"Tune action head diffusion model: {self.tune_diffusion_model}")
         logger.debug(f"Tune action head vlln: {self.tune_vlln}")
@@ -166,6 +187,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             if not self.tune_vlln:
                 self.vlln.eval()
                 self.vl_self_attention.eval()
+            if self.corrector is not None and self.config.correction_freeze_denoiser:
+                for name, module in self.named_children():
+                    if name != "corrector":
+                        module.eval()
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -178,6 +203,98 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _predict_velocity(
+        self,
+        net: nn.Module,
+        noisy_actions: torch.Tensor,
+        timesteps: torch.Tensor,
+        state_features: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        backbone_output: BatchFeature,
+        training_call: bool,
+    ) -> torch.Tensor:
+        """Run one velocity prediction with ``net`` (the head itself or its corrector).
+
+        ``training_call`` reproduces the exact DiT call used by the training forward
+        (attention mask + all hidden states); otherwise the inference call is used.
+        """
+        action_features = net.action_encoder(noisy_actions, timesteps, embodiment_id)
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(
+                action_features.shape[1], dtype=torch.long, device=action_features.device
+            )
+            pos_embs = net.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+
+        # Join vision, language, state and action embedding along sequence dimension.
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+        model_kwargs = dict(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embeds,
+            timestep=timesteps,
+        )
+        if self.config.use_alternate_vl_dit:
+            model_kwargs["image_mask"] = backbone_output.image_mask
+            model_kwargs["backbone_attention_mask"] = backbone_output.backbone_attention_mask
+        if training_call:
+            model_output, _ = net.model(
+                **model_kwargs,
+                encoder_attention_mask=backbone_output.backbone_attention_mask,
+                return_all_hidden_states=True,
+            )
+        else:
+            model_output = net.model(**model_kwargs)
+
+        pred = net.action_decoder(model_output, embodiment_id)
+        return pred[:, -noisy_actions.shape[1] :]
+
+    def _correct_velocity(
+        self,
+        noisy_actions: torch.Tensor,
+        t: torch.Tensor,
+        timesteps: torch.Tensor,
+        velocity: torch.Tensor,
+        corrector_state_features: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        backbone_output: BatchFeature,
+        steps: int,
+        training_call: bool,
+    ) -> torch.Tensor:
+        """Apply the corrector ``steps`` times at a fixed (z, t).
+
+        Each step converts the current velocity into a clean-action proposal
+        ``x_hat = z + (1 - t) * v`` and refines it with full stop-gradient on both the
+        corrector input and the gated skip connection, so the correction loss never
+        sends gradients into the denoiser.
+        """
+        corrector = self.corrector
+        noisy_actions = noisy_actions.detach()
+        vl_embeds = vl_embeds.detach()
+        for _ in range(steps):
+            skip = velocity.detach()
+            proposal = noisy_actions + (1 - t) * skip
+            output = self._predict_velocity(
+                corrector,
+                proposal,
+                timesteps,
+                corrector_state_features,
+                vl_embeds,
+                embodiment_id,
+                backbone_output,
+                training_call=training_call,
+            )
+            velocity = corrector.combine(output, skip)
+        return velocity
+
+    def _num_inference_corrections(self, options: dict[str, Any] | None) -> int:
+        if self.corrector is None:
+            return 0
+        if options is not None and options.get("num_corrections") is not None:
+            return int(options["num_corrections"])
+        return int(self.config.num_inference_corrections)
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -204,7 +321,6 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embeds = backbone_output.backbone_features
-        device = vl_embeds.device
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
@@ -216,6 +332,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
+        corrector_state_features = None
+        if self.corrector is not None:
+            corrector_state_features = self.corrector.state_encoder(
+                action_input.state, embodiment_id
+            )
+
         # Dropout state features (training only): zero out dropped states.
         if self.training and self.state_dropout_prob > 0:
             do_dropout = (
@@ -224,6 +346,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
             do_dropout = do_dropout[:, None, None].to(dtype=state_features.dtype)
             state_features = state_features * (1 - do_dropout)
+            if corrector_state_features is not None:
+                # Same dropout mask for the corrector as for the denoiser.
+                corrector_state_features = corrector_state_features * (1 - do_dropout)
 
         # Embed noised action trajectory.
         actions = action_input.action
@@ -236,54 +361,57 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
-
-        # Maybe add position embedding.
-        if self.config.add_pos_embed:
-            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            action_features = action_features + pos_embs
-
-        # Join vision, language, state and action embedding along sequence dimension.
-        sa_embs = torch.cat((state_features, action_features), dim=1)
-        vl_attn_mask = backbone_output.backbone_attention_mask
-
-        if self.config.use_alternate_vl_dit:
-            image_mask = backbone_output.image_mask
-            backbone_attention_mask = backbone_output.backbone_attention_mask
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-                image_mask=image_mask,
-                backbone_attention_mask=backbone_attention_mask,
-            )
-        else:
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-            )
-
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
+        pred_actions = self._predict_velocity(
+            self,
+            noisy_trajectory,
+            t_discretized,
+            state_features,
+            vl_embeds,
+            embodiment_id,
+            backbone_output,
+            training_call=True,
+        )
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
-        return {
+        outputs = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+
+        if self.corrector is not None:
+            # Correction training: refine the stop-gradient prediction and supervise it
+            # with the same velocity target (same t, noise, conditioning).
+            corrected = self._correct_velocity(
+                noisy_trajectory,
+                t,
+                t_discretized,
+                pred_actions,
+                corrector_state_features,
+                vl_embeds,
+                embodiment_id,
+                backbone_output,
+                steps=self.config.correction_train_steps,
+                training_call=True,
+            )
+            correction_loss = (
+                F.mse_loss(corrected, velocity, reduction="none") * action_mask
+            ).sum() / (action_mask.sum() + 1e-6)
+            outputs["loss"] = (
+                self.config.base_loss_weight * loss
+                + self.config.correction_loss_weight * correction_loss
+            )
+            outputs["base_loss"] = loss.detach()
+            outputs["correction_loss"] = correction_loss.detach()
+            outputs["correction_gate"] = self.corrector.gate.detach().float().mean()
+
+        return outputs
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
@@ -355,6 +483,16 @@ class Gr00tN1d7ActionHead(nn.Module):
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
 
+        # Correction training: K corrector applications per denoising step.
+        num_corrections = self._num_inference_corrections(options)
+        corrector_state_features = None
+        if num_corrections > 0:
+            state = action_input.state
+            corrector_state_features = self.corrector.state_encoder(
+                state.view(state.shape[0], 1, -1), embodiment_id
+            )
+            interval_lo, interval_hi = (float(x) for x in self.config.correction_interval)
+
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
             # action_horizon is the action horizon of the input action.
@@ -402,34 +540,33 @@ class Gr00tN1d7ActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
+            pred_velocity = self._predict_velocity(
+                self,
+                actions,
+                timesteps_tensor,
+                state_features,
+                vl_embeds,
+                embodiment_id,
+                backbone_output,
+                training_call=False,
+            )
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
-
-            # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
+            if num_corrections > 0 and interval_lo <= t_cont < interval_hi:
+                t_tensor = torch.full(
+                    (batch_size, 1, 1), t_cont, dtype=actions.dtype, device=device
                 )
-            else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                pred_velocity = self._correct_velocity(
+                    actions,
+                    t_tensor,
+                    timesteps_tensor,
+                    pred_velocity,
+                    corrector_state_features,
+                    vl_embeds,
+                    embodiment_id,
+                    backbone_output,
+                    steps=num_corrections,
+                    training_call=False,
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength

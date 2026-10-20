@@ -284,6 +284,23 @@ class Gr00tTrainer(Trainer):
         self.loss = loss
 
         # --------------------------------------------------------------
+        # Correction-training metrics (base / corrector loss, gate value)
+        # --------------------------------------------------------------
+        if (
+            model.training
+            and isinstance(outputs, dict)
+            and "correction_loss" in outputs
+            and self.state.global_step % self.args.logging_steps == 0
+        ):
+            metrics = {}
+            for key in ("base_loss", "correction_loss", "correction_gate"):
+                if key in outputs:
+                    value = outputs[key].detach().float().reshape(1)
+                    metrics[key] = self._nested_gather(value).mean().item()
+            if self.args.local_rank in (-1, 0):
+                self.log(metrics)
+
+        # --------------------------------------------------------------
         # Accuracy calculation
         # --------------------------------------------------------------
         if (

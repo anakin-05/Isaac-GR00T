@@ -75,6 +75,21 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         self.train_dataset, self.eval_dataset = self._create_dataset(self.save_cfg_dir)
         self.data_collator = self._create_collator()
 
+    def _correction_overrides(self) -> dict:
+        """Correction-training config fields that override the checkpoint config."""
+        keys = (
+            "use_correction",
+            "base_loss_weight",
+            "correction_loss_weight",
+            "correction_train_steps",
+            "correction_gate_init",
+            "correction_gate_shape",
+            "correction_freeze_denoiser",
+            "num_inference_corrections",
+            "correction_interval",
+        )
+        return {k: getattr(self.config.model, k) for k in keys if hasattr(self.config.model, k)}
+
     def _create_model(self):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
@@ -89,6 +104,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
+                **self._correction_overrides(),
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -96,7 +112,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             missing_keys = loading_info.get("missing_keys", [])
             mask_token_missing = any("mask_token" in key for key in missing_keys)
-            if mask_token_missing and model.action_head.mask_token is not None:
+            if mask_token_missing and getattr(model.action_head, "mask_token", None) is not None:
                 with torch.no_grad():
                     model.action_head.mask_token.data.copy_(
                         0.02 * torch.randn_like(model.action_head.mask_token)
@@ -105,7 +121,20 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            # Correction training from a base checkpoint: the corrector is not in the
+            # checkpoint, so initialize it as a copy of the pretrained denoiser.
+            corrector_missing = [k for k in missing_keys if "action_head.corrector." in k]
+            if corrector_missing and getattr(model.action_head, "corrector", None) is not None:
+                model.action_head.corrector.initialize_from(model.action_head)
+                logging.info(
+                    "Corrector not in checkpoint - initialized from the pretrained action head "
+                    f"({len(corrector_missing)} tensors)"
+                )
+            other_missing = [
+                k
+                for k in missing_keys
+                if "mask_token" not in k and "action_head.corrector." not in k
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")

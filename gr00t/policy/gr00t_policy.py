@@ -87,6 +87,7 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        num_corrections: int | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -96,6 +97,10 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            num_corrections: Correction-training models only. Number of corrector
+                applications per denoising step; overrides the checkpoint's
+                ``num_inference_corrections``. Can also be passed per call via
+                ``options={"num_corrections": K}``.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -110,6 +115,7 @@ class Gr00tPolicy(BasePolicy):
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
         self.model = model
+        self.num_corrections = num_corrections
 
         # Load the processor for input/output transformation.
         # Training saves processor files under a "processor/" subdirectory, but
@@ -413,8 +419,17 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
+        model_options = None
+        num_corrections = self.num_corrections
+        if options is not None and options.get("num_corrections") is not None:
+            num_corrections = options["num_corrections"]
+        if num_corrections is not None:
+            model_options = {"num_corrections": int(num_corrections)}
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            if model_options is None:
+                model_pred = self.model.get_action(**collated_inputs)
+            else:
+                model_pred = self.model.get_action(**collated_inputs, options=model_options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

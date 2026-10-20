@@ -266,6 +266,10 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
+    num_corrections: int | None = None
+    """Correction-training checkpoints only: corrector applications per denoising step
+    (overrides the checkpoint's num_inference_corrections; 0 disables correction)."""
+
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -304,6 +308,7 @@ def main(args: ArgsConfig):
             embodiment_tag=args.embodiment_tag,
             model_path=local_model_path,
             device="cuda" if torch.cuda.is_available() else "cpu",
+            num_corrections=args.num_corrections,
         )
         # Apply --denoising-steps: the action head reads num_inference_timesteps
         # at sampling time.

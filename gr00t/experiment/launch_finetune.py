@@ -80,6 +80,12 @@ if __name__ == "__main__":
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob
+    config.model.use_correction = ft_config.use_correction
+    config.model.correction_loss_weight = ft_config.correction_loss_weight
+    config.model.correction_train_steps = ft_config.correction_train_steps
+    config.model.correction_freeze_denoiser = ft_config.correction_freeze_denoiser
+    config.model.num_inference_corrections = ft_config.num_inference_corrections
+    config.model.correction_interval = tuple(ft_config.correction_interval)
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     config.model.use_percentiles = ft_config.use_percentiles

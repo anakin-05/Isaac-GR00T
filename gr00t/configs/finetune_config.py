@@ -63,6 +63,27 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
+    # --- Correction Training (arXiv 2610.14136) ---
+    use_correction: bool = False
+    """If True, train a corrector (a copy of the action head) that refines the denoiser's
+    stop-gradient clean-action prediction, and apply it at every denoising step at inference."""
+
+    correction_loss_weight: float = 1.0
+    """Weight of the corrector loss relative to the flow-matching loss (paper default 1:1)."""
+
+    correction_train_steps: int = 1
+    """Number of corrections unrolled during training (K_train; paper default 1)."""
+
+    correction_freeze_denoiser: bool = False
+    """If True, freeze the denoising action head and train only the corrector."""
+
+    num_inference_corrections: int = 2
+    """Default number of corrections per denoising step at inference (saved in the config)."""
+
+    correction_interval: tuple[float, float] = (0.0, 1.0)
+    """Apply corrections only at denoising steps whose flow time (0 = noise, 1 = data) is in
+    [lo, hi)."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""

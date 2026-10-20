@@ -302,6 +302,18 @@ def run(config: Config):
         ignore_data_skip=True,
     )
 
+    # Without a distributed launcher (plain `python`), HF Trainer wraps the model in
+    # nn.DataParallel whenever more than one GPU is visible. That breaks the model's
+    # `device` property (DataParallel replicas expose no parameters -> StopIteration)
+    # and silently multiplies the batch size beyond global_batch_size. Pin to one GPU.
+    if os.environ.get("WORLD_SIZE") is None and training_args.n_gpu > 1:
+        logging.warning(
+            f"{training_args.n_gpu} GPUs visible but no distributed launcher was used; "
+            "training on a single GPU. Use torchrun (examples/finetune.sh with NUM_GPUS>1) "
+            "for multi-GPU training."
+        )
+        training_args._n_gpu = 1
+
     # Create trainer
     trainer = Gr00tTrainer(
         model=model,

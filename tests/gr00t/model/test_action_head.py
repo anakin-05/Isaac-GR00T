@@ -261,3 +261,145 @@ class TestActionHeadTrainableParams:
         head.set_trainable_parameters(True, False, True)
         for p in head.model.parameters():
             assert not p.requires_grad
+
+
+def _correction_head(**overrides):
+    config = _small_config(use_correction=True, **overrides)
+    head = Gr00tN1d7ActionHead(config)
+    return head, config
+
+
+def _get_action_input(config, batch_size=2):
+    action_input = _make_action_input(config, batch_size=batch_size)
+    del action_input["action"]
+    return action_input
+
+
+class TestCorrectionTraining:
+    """Correction training (arXiv 2610.14136): corrector, losses, stop-gradient, inference."""
+
+    def test_disabled_by_default(self, action_head):
+        head, _ = action_head
+        assert head.corrector is None
+        head.train()
+        out = head.forward(_make_backbone_output(head.config), _make_action_input(head.config))
+        assert "correction_loss" not in out
+
+    def test_corrector_is_copy_of_denoiser(self):
+        head, _ = _correction_head()
+        for name in ("state_encoder", "action_encoder", "model", "action_decoder"):
+            ref = getattr(head, name).state_dict()
+            cor = getattr(head.corrector, name).state_dict()
+            assert ref.keys() == cor.keys()
+            for k in ref:
+                assert torch.equal(ref[k], cor[k])
+                assert ref[k].data_ptr() != cor[k].data_ptr()
+        assert torch.equal(head.corrector.gate, torch.zeros(1))
+
+    def test_initialize_from_resets_weights_and_gate(self):
+        head, _ = _correction_head()
+        with torch.no_grad():
+            for p in head.corrector.parameters():
+                p.add_(1.0)
+        head.corrector.initialize_from(head)
+        for k, v in head.model.state_dict().items():
+            assert torch.equal(v, head.corrector.model.state_dict()[k])
+        assert torch.equal(head.corrector.gate, torch.zeros(1))
+
+    def test_forward_losses(self):
+        head, config = _correction_head(correction_loss_weight=0.5)
+        head.train()
+        out = head.forward(_make_backbone_output(config), _make_action_input(config))
+        for key in ("loss", "base_loss", "correction_loss", "correction_gate"):
+            assert key in out and torch.isfinite(out[key])
+        expected = out["base_loss"] + 0.5 * out["correction_loss"]
+        assert torch.allclose(out["loss"], expected)
+
+    def test_correction_loss_equals_base_loss_at_init(self):
+        # Gate = 0 => corrected velocity == base velocity.
+        head, config = _correction_head()
+        head.train()
+        out = head.forward(_make_backbone_output(config), _make_action_input(config))
+        assert torch.allclose(out["base_loss"], out["correction_loss"])
+
+    @pytest.mark.parametrize("train_steps", [1, 2])
+    def test_stop_gradient_into_denoiser(self, train_steps):
+        head, config = _correction_head(correction_train_steps=train_steps)
+        with torch.no_grad():
+            head.corrector.gate.fill_(0.5)  # nonzero gate so the corrector gets gradients
+        head.train()
+        backbone_output = _make_backbone_output(config)
+        vl_leaf = backbone_output["backbone_features"].requires_grad_(True)
+        head.config.base_loss_weight = 0.0
+        out = head.forward(backbone_output, _make_action_input(config))
+        out["loss"].backward()
+        for name, p in head.named_parameters():
+            if name.startswith("corrector."):
+                continue
+            assert p.grad is None or torch.count_nonzero(p.grad) == 0, name
+        # No gradient into the VLM features / vlln (zeros come from the 0-weighted base loss).
+        assert vl_leaf.grad is None or torch.count_nonzero(vl_leaf.grad) == 0
+        assert head.corrector.gate.grad is not None
+        assert any(
+            p.grad is not None and torch.count_nonzero(p.grad) > 0
+            for p in head.corrector.model.parameters()
+        )
+
+    def test_get_action_matches_base_at_init(self):
+        head, config = _correction_head()
+        head.eval()
+        backbone_output = _make_backbone_output(config)
+        action_input = _get_action_input(config)
+        torch.manual_seed(0)
+        base = head.get_action(backbone_output, action_input, options={"num_corrections": 0})
+        torch.manual_seed(0)
+        corrected = head.get_action(backbone_output, action_input, options={"num_corrections": 3})
+        assert torch.allclose(base["action_pred"], corrected["action_pred"], atol=1e-6)
+
+    def test_get_action_uses_corrector(self):
+        head, config = _correction_head(num_inference_corrections=2)
+        head.eval()
+        with torch.no_grad():
+            head.corrector.gate.fill_(1.0)
+            for p in head.corrector.action_decoder.parameters():
+                p.add_(0.1)
+        backbone_output = _make_backbone_output(config)
+        action_input = _get_action_input(config)
+        torch.manual_seed(0)
+        base = head.get_action(backbone_output, action_input, options={"num_corrections": 0})
+        torch.manual_seed(0)
+        corrected = head.get_action(backbone_output, action_input)  # config default K=2
+        assert corrected["action_pred"].shape == base["action_pred"].shape
+        assert not torch.allclose(base["action_pred"], corrected["action_pred"])
+
+    def test_correction_interval_gates_steps(self):
+        head, config = _correction_head(correction_interval=(2.0, 3.0))  # never active
+        head.eval()
+        with torch.no_grad():
+            head.corrector.gate.fill_(1.0)
+            for p in head.corrector.action_decoder.parameters():
+                p.add_(0.1)
+        backbone_output = _make_backbone_output(config)
+        action_input = _get_action_input(config)
+        torch.manual_seed(0)
+        base = head.get_action(backbone_output, action_input, options={"num_corrections": 0})
+        torch.manual_seed(0)
+        corrected = head.get_action(backbone_output, action_input, options={"num_corrections": 2})
+        assert torch.allclose(base["action_pred"], corrected["action_pred"])
+
+    def test_freeze_denoiser(self):
+        head, _ = _correction_head(correction_freeze_denoiser=True)
+        for name, p in head.named_parameters():
+            assert p.requires_grad == name.startswith("corrector."), name
+
+    def test_corrector_trainable_when_projector_frozen(self):
+        head, _ = _correction_head(tune_projector=False, tune_diffusion_model=False)
+        assert all(p.requires_grad for p in head.corrector.parameters())
+        assert not any(p.requires_grad for p in head.model.parameters())
+
+    def test_channel_gate_and_meta_construction(self):
+        head, config = _correction_head(correction_gate_shape="channel")
+        assert head.corrector.gate.shape == (config.max_action_dim,)
+        with torch.device("meta"):
+            meta_head = Gr00tN1d7ActionHead(_small_config(use_correction=True))
+        assert meta_head.corrector.gate.device.type == "meta"

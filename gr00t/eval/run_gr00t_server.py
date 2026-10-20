@@ -87,6 +87,17 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    num_corrections: int | None = None
+    """Correction-training checkpoints only: corrector applications per denoising step
+    (overrides the checkpoint's num_inference_corrections; 0 disables correction)."""
+
+    correction_interval: tuple[float, float] | None = None
+    """Correction-training checkpoints only: apply corrections only at denoising steps whose flow
+    time (0 = noise, 1 = data) lies in [lo, hi). Overrides the checkpoint's correction_interval."""
+
+    denoising_steps: int | None = None
+    """Override the number of flow-matching denoising steps (checkpoint default: 4)."""
+
 
 def main(config: ServerConfig):
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
@@ -107,7 +118,25 @@ def main(config: ServerConfig):
             model_path=config.model_path,
             device=config.device,
             strict=config.strict,
+            num_corrections=config.num_corrections,
         )
+        action_head = policy.model.action_head
+        if config.correction_interval is not None:
+            action_head.config.correction_interval = tuple(config.correction_interval)
+        if config.denoising_steps is not None:
+            action_head.num_inference_timesteps = config.denoising_steps
+        if getattr(action_head, "corrector", None) is not None:
+            k = (
+                config.num_corrections
+                if config.num_corrections is not None
+                else action_head.config.num_inference_corrections
+            )
+            print(
+                f"  Correction: K={k}, interval={tuple(action_head.config.correction_interval)}, "
+                f"gate={action_head.corrector.gate.float().mean().item():.4f}",
+                flush=True,
+            )
+        print(f"  Denoising steps: {action_head.num_inference_timesteps}", flush=True)
     elif config.dataset_path is not None:
         if config.execution_horizon is None:
             raise ValueError(
