@@ -104,5 +104,39 @@ BASELINE_MODEL_PATH=<non-correction checkpoint> N_EPISODES=10 \
 - **Preview and resume.** `DRY_RUN=1` lists the configurations without running them. Finished
   configurations are skipped, so an interrupted sweep resumes where it stopped.
 
+### Open-loop sweep on held-out demonstrations
+
+`examples/LIBERO/sweep_correction_open_loop_libero_10.sh` sweeps the same grid without a
+simulator, against a held-out split (default: the LIBERO-10 `long_90%` split). For each
+checkpoint it runs `gr00t/eval/open_loop_eval_correction.py` once, and that run evaluates every
+setting of K, interval and denoising steps.
+- **Shared backbone.** The backbone runs once per batch and is shared by every setting.
+- **Same noise.** Every setting and every checkpoint is sampled with the same noise on the same
+  chunks, so all comparisons are paired.
+- **Metrics.** The metrics and outputs match `sweep_autoguidance_open_loop_libero_10.sh`:
+  - `avg_mse` and `avg_mae` over every full action chunk.
+  - Arm and gripper MSE, and gripper sign accuracy.
+  - Magnitude and jerk ratios against the demonstrations.
+  - MSE and MAE per horizon step and per action key.
+  - Per-chunk `per_step.csv` / `.npz`.
+- **Paired comparisons.** These are made against the same checkpoint's base denoiser `K0_d<d>`:
+  - `delta_mse_pct_vs_k0`, with its standard error over trajectories.
+  - Win rates (all, arm, gripper and per trajectory), where exact ties count as half.
+  - `avg_shift_vs_k0`.
+- **Baseline columns.** The combined table also compares each setting against the first
+  `BASELINE_MODEL_PATHS` checkpoint (`b_mse%`, `b_win`).
+
+```bash
+RUN_DIRS="examples/LIBERO/logs/libero-subset-lerobot-10/<correction run>" \
+CKPT_STEPS="3232 final" NUM_CORRECTIONS="0 1 2 4" INTERVALS="0.0,1.0 0.0,0.5" \
+BASELINE_MODEL_PATHS=<non-correction checkpoint> \
+  bash examples/LIBERO/sweep_correction_open_loop_libero_10.sh
+```
+
+Results go to `examples/LIBERO/logs/open_loop_results/open-loop_<SWEEP_NAME>_seed<SEED>/`, with
+one directory per checkpoint plus a combined `sweep_summary.json` / `.csv`. All trajectories are
+evaluated unless `TRAJ_IDS` or `MAX_STEPS_PER_TRAJ` is set. `NUM_SHARDS` / `SHARD_ID` split the
+checkpoints across GPUs, `SUMMARY_ONLY=1` rebuilds the table and finished checkpoints are skipped.
+
 Each corrected denoising step costs `1 + K` DiT evaluations. The TensorRT `dit_only`
 deployment path replaces `get_action_with_features` and does not run the corrector.
